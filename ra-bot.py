@@ -41,7 +41,7 @@ from telegram.ext import (
 
 )
 
-from telegram.error import NetworkError  # noqa: F401
+from telegram.error import NetworkError, RetryAfter, TimedOut
 
 
 
@@ -366,6 +366,31 @@ def run_shell(cmd: str, timeout: Optional[int] = None) -> str:
     except Exception as e:
 
         return f"[ERR] {e}"
+
+
+async def telegram_call_with_retry(fn, *args, retries: int = 3, retry_delay: float = 3.0, **kwargs):
+
+    attempt = 0
+
+    while True:
+
+        try:
+
+            return await fn(*args, **kwargs)
+
+        except RetryAfter as exc:
+
+            await asyncio.sleep(float(getattr(exc, "retry_after", 1)) + 1.0)
+
+        except (TimedOut, NetworkError):
+
+            attempt += 1
+
+            if attempt > retries:
+
+                raise
+
+            await asyncio.sleep(retry_delay * attempt)
 
 
 def usb_watchdog_available() -> bool:
@@ -3767,7 +3792,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "SPD_NOW":
 
-        waiting = await query.message.reply_text("Menjalankan speedtest... mohon tunggu ±20–90 detik.")
+        waiting = None
+
+        try:
+
+            waiting = await telegram_call_with_retry(
+
+                query.message.reply_text,
+
+                "Menjalankan speedtest... mohon tunggu ±20–90 detik.",
+
+            )
+
+        except (TimedOut, NetworkError) as exc:
+
+            print(f"[WARN] Gagal mengirim pesan awal speedtest: {exc}")
+
+        except Exception as exc:
+
+            print(f"[WARN] Gagal mengirim pesan awal speedtest: {exc}")
 
         sid = settings_get("speedtest_server_id", "")
 
@@ -3783,19 +3826,53 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         finally:
 
-            with contextlib.suppress(Exception):
+            if waiting is not None:
 
-                await waiting.delete()
+                with contextlib.suppress(Exception):
+
+                    await waiting.delete()
 
         if error_msg:
 
-            await query.message.reply_text(error_msg, reply_markup=speedtest_menu_keyboard()); return
+            try:
+
+                await telegram_call_with_retry(
+
+                    query.message.reply_text,
+
+                    error_msg,
+
+                    reply_markup=speedtest_menu_keyboard(),
+
+                )
+
+            except Exception as exc:
+
+                print(f"[WARN] Gagal mengirim pesan error speedtest: {exc}")
+
+            return
 
         raw_clean = _raw.strip()
 
         if raw_clean.startswith("[ERR]"):
 
-            await query.message.reply_text(raw_clean, reply_markup=speedtest_menu_keyboard()); return
+            try:
+
+                await telegram_call_with_retry(
+
+                    query.message.reply_text,
+
+                    raw_clean,
+
+                    reply_markup=speedtest_menu_keyboard(),
+
+                )
+
+            except Exception as exc:
+
+                print(f"[WARN] Gagal mengirim hasil error speedtest: {exc}")
+
+            return
 
         ts = int(time.time())
 
@@ -3809,7 +3886,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         result_text = build_speedtest_result_text(ts, lat, jit, down, up, loss, url)
 
-        await query.message.reply_text(result_text, parse_mode="Markdown", reply_markup=speedtest_menu_keyboard()); return
+        try:
+
+            await telegram_call_with_retry(
+
+                query.message.reply_text,
+
+                result_text,
+
+                parse_mode="Markdown",
+
+                reply_markup=speedtest_menu_keyboard(),
+
+            )
+
+        except Exception as exc:
+
+            print(f"[WARN] Gagal mengirim hasil speedtest: {exc}")
+
+        return
 
 
 
