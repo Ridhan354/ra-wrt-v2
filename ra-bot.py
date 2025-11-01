@@ -62,6 +62,16 @@ DB_PATH = os.getenv("RANET_DB_PATH", "/opt/ranet-bot/speedtest.db")
 SPEEDTEST_BIN_ENV = os.getenv("SPEEDTEST_BIN", "").strip()
 
 
+_OOKLA_SHARE_UNSUPPORTED = False
+
+
+def _note_ookla_share_unsupported() -> None:
+    global _OOKLA_SHARE_UNSUPPORTED
+    if not _OOKLA_SHARE_UNSUPPORTED:
+        print("[INFO] Speedtest CLI versi ini tidak mendukung opsi --share; link hasil mungkin kosong")
+        _OOKLA_SHARE_UNSUPPORTED = True
+
+
 
 # Path script setup netbird
 
@@ -3012,7 +3022,7 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
         if out.strip().startswith("[ERR]"):
 
             if "Unrecognized option" in out and "--share" in out:
-                print("[WARN] speedtest CLI tidak mendukung --share; fallback tanpa share")
+                _note_ookla_share_unsupported()
                 json_attempt = run_cmd(_build_cmd([*base_parts, "--format=json"]), timeout=180)
                 if json_attempt.strip().startswith("[ERR]") and "Unrecognized option" in json_attempt and "--format" in json_attempt:
                     print("[WARN] speedtest CLI juga tidak mendukung --format=json; gunakan output standar")
@@ -3060,7 +3070,7 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
                 result = data.get("result", {}) if isinstance(data.get("result"), dict) else {}
                 url = result.get("url") or result.get("share") or ""
 
-                if not url:
+                if not url and not _OOKLA_SHARE_UNSUPPORTED:
                     print("[WARN] Speedtest Ookla JSON tidak mengembalikan Result URL")
 
                 return latency, jitter, down, up, loss, str(url), out
@@ -3094,8 +3104,8 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
         url = url_pat.group(1) if url_pat else ""
 
         if not url:
-
-            print("[WARN] Speedtest Ookla tidak mengembalikan Result URL (mungkin share gagal)")
+            if not _OOKLA_SHARE_UNSUPPORTED:
+                print("[WARN] Speedtest Ookla tidak mengembalikan Result URL (mungkin share gagal)")
 
         return latency, jitter, down, up, loss, url, out
 
@@ -3133,8 +3143,8 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
         url = url_pat.group(1) if url_pat else ""
 
         if not url:
-
-            print("[WARN] Speedtest CLI tidak mengembalikan Result URL (mungkin upload share gagal)")
+            if not _OOKLA_SHARE_UNSUPPORTED:
+                print("[WARN] Speedtest CLI tidak mengembalikan Result URL (mungkin upload share gagal)")
 
         return latency, jitter, down, up, loss, url, out
 
