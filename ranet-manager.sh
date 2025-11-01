@@ -15,10 +15,10 @@ LOG_FILE="$INSTALL_DIR/ra-bot.log"
 PID_FILE="$INSTALL_DIR/ra-bot.pid"
 ID_FILE="$INSTALL_DIR/id-telegram.txt"
 INIT_SCRIPT="/etc/init.d/ranet-bot"
-REPO_BOT_PATH="$SCRIPT_DIR/ra-bot.py"
-REPO_SETUP_NETBIRD="$SCRIPT_DIR/setup-netbird.sh"
-REPO_USB_WD="$SCRIPT_DIR/usb-watchdog-setup.sh"
-BOT_UPDATE_URL="https://raw.githubusercontent.com/Ridhan354/ra-wrt-v2/main/ra-bot.py"
+RAW_BASE_URL="https://raw.githubusercontent.com/Ridhan354/ra-wrt-v2/main"
+BOT_UPDATE_URL="$RAW_BASE_URL/ra-bot.py"
+SETUP_NETBIRD_URL="$RAW_BASE_URL/setup-netbird.sh"
+USB_WD_URL="$RAW_BASE_URL/usb-watchdog-setup.sh"
 
 # Busybox ash doesn't support functions with hyphen names
 
@@ -66,18 +66,36 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-copy_with_mode() {
-    src="$1"
+download_file() {
+    url="$1"
     dest="$2"
     mode=${3:-755}
+
     dest_dir="$(dirname "$dest")"
     [ -d "$dest_dir" ] || mkdir -p "$dest_dir"
-    if command_exists install; then
-        install -m $mode "$src" "$dest"
-    else
-        cp "$src" "$dest"
-        chmod $mode "$dest"
+
+    tmp_file="${dest}.tmp.$$"
+
+    if command_exists curl; then
+        if curl -fsSL "$url" -o "$tmp_file"; then
+            mv "$tmp_file" "$dest"
+            chmod $mode "$dest"
+            return 0
+        fi
+        rm -f "$tmp_file"
     fi
+
+    if command_exists wget; then
+        if wget -q -O "$tmp_file" "$url"; then
+            mv "$tmp_file" "$dest"
+            chmod $mode "$dest"
+            return 0
+        fi
+        rm -f "$tmp_file"
+    fi
+
+    echo "[ERR] Gagal mengunduh $url. Pastikan curl atau wget tersedia." >&2
+    return 1
 }
 
 install_python_requirements() {
@@ -127,35 +145,29 @@ write_credentials() {
 }
 
 maybe_copy_optional_scripts() {
-    printf '\nSalin setup-netbird.sh ke %s? [y/N]: ' "$INSTALL_DIR"
+    printf '\nUnduh setup-netbird.sh ke %s? [y/N]: ' "$INSTALL_DIR"
     read answer || answer=""
     case "$answer" in
         y|Y)
-            if [ -f "$REPO_SETUP_NETBIRD" ]; then
-                copy_with_mode "$REPO_SETUP_NETBIRD" "$INSTALL_DIR/setup-netbird.sh" 755
-                echo "setup-netbird.sh disalin."
-            else
-                echo "[INFO] setup-netbird.sh tidak ditemukan di repo." >&2
+            if download_file "$SETUP_NETBIRD_URL" "$INSTALL_DIR/setup-netbird.sh" 755; then
+                echo "setup-netbird.sh diunduh."
             fi
             ;;
         *)
-            echo "Lewati penyalinan setup-netbird.sh."
+            echo "Lewati pengunduhan setup-netbird.sh."
             ;;
     esac
 
-    printf 'Salin usb-watchdog-setup.sh ke %s? [y/N]: ' "$INSTALL_DIR"
+    printf 'Unduh usb-watchdog-setup.sh ke %s? [y/N]: ' "$INSTALL_DIR"
     read answer || answer=""
     case "$answer" in
         y|Y)
-            if [ -f "$REPO_USB_WD" ]; then
-                copy_with_mode "$REPO_USB_WD" "$INSTALL_DIR/usb-watchdog-setup.sh" 755
-                echo "usb-watchdog-setup.sh disalin."
-            else
-                echo "[INFO] usb-watchdog-setup.sh tidak ditemukan di repo." >&2
+            if download_file "$USB_WD_URL" "$INSTALL_DIR/usb-watchdog-setup.sh" 755; then
+                echo "usb-watchdog-setup.sh diunduh."
             fi
             ;;
         *)
-            echo "Lewati penyalinan usb-watchdog-setup.sh."
+            echo "Lewati pengunduhan usb-watchdog-setup.sh."
             ;;
     esac
 }
@@ -166,11 +178,11 @@ install_bot() {
 
     install_python_requirements
 
-    if [ -f "$REPO_BOT_PATH" ]; then
-        copy_with_mode "$REPO_BOT_PATH" "$BOT_SCRIPT" 755
-        echo "ra-bot.py disalin ke $BOT_SCRIPT"
+    if download_file "$BOT_UPDATE_URL" "$BOT_SCRIPT" 755; then
+        echo "ra-bot.py diunduh ke $BOT_SCRIPT"
     else
-        echo "[PERINGATAN] ra-bot.py tidak ditemukan di $REPO_BOT_PATH." >&2
+        echo "[ERR] Instalasi dibatalkan karena gagal mengunduh ra-bot.py." >&2
+        return 1
     fi
 
     maybe_copy_optional_scripts
@@ -316,26 +328,11 @@ disable_boot() {
 update_bot() {
     require_root || return 1
     ensure_directory "$INSTALL_DIR"
-    tmp_file="$INSTALL_DIR/.ra-bot.py.tmp"
-    if command_exists curl; then
-        if curl -fsSL "$BOT_UPDATE_URL" -o "$tmp_file"; then
-            mv "$tmp_file" "$BOT_SCRIPT"
-            chmod 755 "$BOT_SCRIPT"
-            echo "Bot diperbarui dari GitHub."
-            return
-        fi
-        rm -f "$tmp_file"
+    if download_file "$BOT_UPDATE_URL" "$BOT_SCRIPT" 755; then
+        echo "Bot diperbarui dari GitHub."
+    else
+        return 1
     fi
-    if command_exists wget; then
-        if wget -q -O "$tmp_file" "$BOT_UPDATE_URL"; then
-            mv "$tmp_file" "$BOT_SCRIPT"
-            chmod 755 "$BOT_SCRIPT"
-            echo "Bot diperbarui dari GitHub."
-            return
-        fi
-        rm -f "$tmp_file"
-    fi
-    echo "[ERR] Gagal memperbarui bot. Pastikan curl atau wget tersedia." >&2
 }
 
 tail_log() {
