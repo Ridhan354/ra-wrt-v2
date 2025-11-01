@@ -41,7 +41,7 @@ from telegram.ext import (
 
 )
 
-from telegram.error import NetworkError  # noqa: F401
+from telegram.error import NetworkError, RetryAfter, TimedOut
 
 
 
@@ -317,7 +317,7 @@ BOT_UPDATE_URL = os.getenv(
 
     "RANET_BOT_UPDATE_URL",
 
-    "https://raw.githubusercontent.com/Ridhan354/ra-bot/main/ra-botV23.py",
+    "https://raw.githubusercontent.com/Ridhan354/ra-wrt-v2/main/ra-bot.py",
 
 )
 
@@ -366,6 +366,41 @@ def run_shell(cmd: str, timeout: Optional[int] = None) -> str:
     except Exception as e:
 
         return f"[ERR] {e}"
+
+
+async def telegram_call_with_retry(fn, *args, retries: int = 3, retry_delay: float = 3.0, **kwargs):
+
+    attempt = 0
+
+    fn_name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None) or repr(fn)
+
+    while True:
+
+        try:
+
+            return await fn(*args, **kwargs)
+
+        except RetryAfter as exc:
+
+            delay = float(getattr(exc, "retry_after", 1)) + 1.0
+
+            print(f"[WARN] Telegram retry-after {fn_name}: tunggu {delay:.1f}s")
+
+            await asyncio.sleep(delay)
+
+        except (TimedOut, NetworkError) as exc:
+
+            attempt += 1
+
+            print(f"[WARN] Telegram call {fn_name} percobaan {attempt}/{retries + 1} gagal: {exc}")
+
+            if attempt > retries:
+
+                print(f"[ERR] Telegram call {fn_name} gagal total setelah {attempt} percobaan: {exc}")
+
+                raise
+
+            await asyncio.sleep(retry_delay * attempt)
 
 
 def usb_watchdog_available() -> bool:
@@ -2962,11 +2997,73 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
 
     if mode == "ookla":
 
-        cmd = bin_name
+        def _build_cmd(parts: List[str]) -> str:
+            return " ".join(shlex.quote(str(p)) for p in parts)
 
-        if server_id: cmd = f"{bin_name} --server-id {server_id}"
+        base_parts: List[str] = [bin_name, "--progress=no", "--accept-license", "--accept-gdpr"]
 
-        out = run_cmd(cmd, timeout=120)
+        if server_id:
+            base_parts.extend(["--server-id", str(server_id)])
+
+        out = run_cmd(_build_cmd([*base_parts, "--share"]), timeout=180)
+
+        used_json = False
+
+        if out.strip().startswith("[ERR]"):
+
+            if "Unrecognized option" in out and "--share" in out:
+                print("[WARN] speedtest CLI tidak mendukung --share; fallback tanpa share")
+                json_attempt = run_cmd(_build_cmd([*base_parts, "--format=json"]), timeout=180)
+                if json_attempt.strip().startswith("[ERR]") and "Unrecognized option" in json_attempt and "--format" in json_attempt:
+                    print("[WARN] speedtest CLI juga tidak mendukung --format=json; gunakan output standar")
+                    out = run_cmd(_build_cmd(base_parts), timeout=180)
+                else:
+                    out = json_attempt
+                    used_json = out.lstrip().startswith("{")
+
+            if out.strip().startswith("[ERR]"):
+                return 0.0, 0.0, 0.0, 0.0, 0.0, "", out
+
+        if used_json:
+            try:
+                data = json.loads(out)
+            except Exception as exc:
+                print(f"[WARN] Gagal parse JSON speedtest: {exc}")
+            else:
+                ping = data.get("ping", {})
+                latency = float(ping.get("latency") or 0.0)
+                jitter = float(ping.get("jitter") or 0.0)
+
+                def _parse_bps(section: Dict[str, object]) -> float:
+                    if not isinstance(section, dict):
+                        return 0.0
+                    bps = section.get("bandwidth")
+                    if bps is None:
+                        bps = section.get("bitsPerSecond") or section.get("bps")
+                    try:
+                        bps_val = float(bps)
+                    except (TypeError, ValueError):
+                        return 0.0
+                    if section.get("bandwidth") is not None:
+                        return (bps_val * 8.0) / 1_000_000.0
+                    return bps_val / 1_000_000.0
+
+                down = _parse_bps(data.get("download"))
+                up = _parse_bps(data.get("upload"))
+
+                loss_raw = data.get("packetLoss")
+                try:
+                    loss = float(loss_raw) if loss_raw is not None else 0.0
+                except (TypeError, ValueError):
+                    loss = 0.0
+
+                result = data.get("result", {}) if isinstance(data.get("result"), dict) else {}
+                url = result.get("url") or result.get("share") or ""
+
+                if not url:
+                    print("[WARN] Speedtest Ookla JSON tidak mengembalikan Result URL")
+
+                return latency, jitter, down, up, loss, str(url), out
 
         lat_pat = re.search(r"(?:Idle\s+)?Latency:\s*([0-9.]+)\s*ms\s*\(jitter:\s*([0-9.]+)ms", out)
 
@@ -2996,11 +3093,22 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
 
         url = url_pat.group(1) if url_pat else ""
 
+        if not url:
+
+            print("[WARN] Speedtest Ookla tidak mengembalikan Result URL (mungkin share gagal)")
+
         return latency, jitter, down, up, loss, url, out
 
     else:
 
-        out = run_cmd(bin_name, timeout=180)
+        cmd_parts = [shlex.quote(bin_name), "--share"]
+
+        if server_id:
+            cmd_parts.extend(["--server", shlex.quote(str(server_id))])
+
+        cmd = " ".join(cmd_parts)
+
+        out = run_cmd(cmd, timeout=210)
 
         lat_pat = re.search(r"Latency:\s*([0-9.]+)\s*ms", out) or re.search(r"Ping:\s*([0-9.]+)\s*ms", out)
 
@@ -3024,8 +3132,16 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
 
         url = url_pat.group(1) if url_pat else ""
 
+        if not url:
+
+            print("[WARN] Speedtest CLI tidak mengembalikan Result URL (mungkin upload share gagal)")
+
         return latency, jitter, down, up, loss, url, out
 
+
+async def run_speedtest_and_parse_async(server_id: Optional[str] = None) -> Tuple[float,float,float,float,float,str,str]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, run_speedtest_and_parse, server_id)
 
 
 def format_speedtest_entry(idx:int, ts:int, lat:float, jit:float, down:float, up:float, loss:float, url:str) -> str:
@@ -3763,11 +3879,87 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "SPD_NOW":
 
-        waiting = await query.message.reply_text("Menjalankan speedtest... mohon tunggu ±20–90 detik.")
+        waiting = None
+
+        try:
+
+            waiting = await telegram_call_with_retry(
+
+                query.message.reply_text,
+
+                "Menjalankan speedtest... mohon tunggu ±20–90 detik.",
+
+            )
+
+        except (TimedOut, NetworkError) as exc:
+
+            print(f"[WARN] Gagal mengirim pesan awal speedtest: {exc}")
+
+        except Exception as exc:
+
+            print(f"[WARN] Gagal mengirim pesan awal speedtest: {exc}")
 
         sid = settings_get("speedtest_server_id", "")
 
-        lat, jit, down, up, loss, url, _raw = run_speedtest_and_parse(sid if sid else None)
+        error_msg = None
+
+        try:
+
+            lat, jit, down, up, loss, url, _raw = await run_speedtest_and_parse_async(sid if sid else None)
+
+        except Exception as exc:
+
+            error_msg = f"[ERR] Speedtest gagal: {exc}"
+
+        finally:
+
+            if waiting is not None:
+
+                with contextlib.suppress(Exception):
+
+                    await waiting.delete()
+
+        if error_msg:
+
+            try:
+
+                await telegram_call_with_retry(
+
+                    query.message.reply_text,
+
+                    error_msg,
+
+                    reply_markup=speedtest_menu_keyboard(),
+
+                )
+
+            except Exception as exc:
+
+                print(f"[WARN] Gagal mengirim pesan error speedtest: {exc}")
+
+            return
+
+        raw_clean = _raw.strip()
+
+        if raw_clean.startswith("[ERR]"):
+
+            try:
+
+                await telegram_call_with_retry(
+
+                    query.message.reply_text,
+
+                    raw_clean,
+
+                    reply_markup=speedtest_menu_keyboard(),
+
+                )
+
+            except Exception as exc:
+
+                print(f"[WARN] Gagal mengirim hasil error speedtest: {exc}")
+
+            return
 
         ts = int(time.time())
 
@@ -3779,11 +3971,27 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             pass
 
-        await waiting.delete()
-
         result_text = build_speedtest_result_text(ts, lat, jit, down, up, loss, url)
 
-        await query.message.reply_text(result_text, parse_mode="Markdown", reply_markup=speedtest_menu_keyboard()); return
+        try:
+
+            await telegram_call_with_retry(
+
+                query.message.reply_text,
+
+                result_text,
+
+                parse_mode="Markdown",
+
+                reply_markup=speedtest_menu_keyboard(),
+
+            )
+
+        except Exception as exc:
+
+            print(f"[WARN] Gagal mengirim hasil speedtest: {exc}")
+
+        return
 
 
 
