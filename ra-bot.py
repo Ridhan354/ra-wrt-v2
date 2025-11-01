@@ -2997,14 +2997,73 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
 
     if mode == "ookla":
 
-        cmd_parts = [shlex.quote(bin_name), "--progress=no", "--accept-license", "--accept-gdpr", "--share"]
+        def _build_cmd(parts: List[str]) -> str:
+            return " ".join(shlex.quote(str(p)) for p in parts)
+
+        base_parts: List[str] = [bin_name, "--progress=no", "--accept-license", "--accept-gdpr"]
 
         if server_id:
-            cmd_parts.extend(["--server-id", shlex.quote(str(server_id))])
+            base_parts.extend(["--server-id", str(server_id)])
 
-        cmd = " ".join(cmd_parts)
+        out = run_cmd(_build_cmd([*base_parts, "--share"]), timeout=180)
 
-        out = run_cmd(cmd, timeout=180)
+        used_json = False
+
+        if out.strip().startswith("[ERR]"):
+
+            if "Unrecognized option" in out and "--share" in out:
+                print("[WARN] speedtest CLI tidak mendukung --share; fallback tanpa share")
+                json_attempt = run_cmd(_build_cmd([*base_parts, "--format=json"]), timeout=180)
+                if json_attempt.strip().startswith("[ERR]") and "Unrecognized option" in json_attempt and "--format" in json_attempt:
+                    print("[WARN] speedtest CLI juga tidak mendukung --format=json; gunakan output standar")
+                    out = run_cmd(_build_cmd(base_parts), timeout=180)
+                else:
+                    out = json_attempt
+                    used_json = out.lstrip().startswith("{")
+
+            if out.strip().startswith("[ERR]"):
+                return 0.0, 0.0, 0.0, 0.0, 0.0, "", out
+
+        if used_json:
+            try:
+                data = json.loads(out)
+            except Exception as exc:
+                print(f"[WARN] Gagal parse JSON speedtest: {exc}")
+            else:
+                ping = data.get("ping", {})
+                latency = float(ping.get("latency") or 0.0)
+                jitter = float(ping.get("jitter") or 0.0)
+
+                def _parse_bps(section: Dict[str, object]) -> float:
+                    if not isinstance(section, dict):
+                        return 0.0
+                    bps = section.get("bandwidth")
+                    if bps is None:
+                        bps = section.get("bitsPerSecond") or section.get("bps")
+                    try:
+                        bps_val = float(bps)
+                    except (TypeError, ValueError):
+                        return 0.0
+                    if section.get("bandwidth") is not None:
+                        return (bps_val * 8.0) / 1_000_000.0
+                    return bps_val / 1_000_000.0
+
+                down = _parse_bps(data.get("download"))
+                up = _parse_bps(data.get("upload"))
+
+                loss_raw = data.get("packetLoss")
+                try:
+                    loss = float(loss_raw) if loss_raw is not None else 0.0
+                except (TypeError, ValueError):
+                    loss = 0.0
+
+                result = data.get("result", {}) if isinstance(data.get("result"), dict) else {}
+                url = result.get("url") or result.get("share") or ""
+
+                if not url:
+                    print("[WARN] Speedtest Ookla JSON tidak mengembalikan Result URL")
+
+                return latency, jitter, down, up, loss, str(url), out
 
         lat_pat = re.search(r"(?:Idle\s+)?Latency:\s*([0-9.]+)\s*ms\s*\(jitter:\s*([0-9.]+)ms", out)
 
