@@ -19,6 +19,37 @@ RAW_BASE_URL="https://raw.githubusercontent.com/Ridhan354/ra-wrt-v2/main"
 BOT_UPDATE_URL="$RAW_BASE_URL/ra-bot.py"
 SETUP_NETBIRD_URL="$RAW_BASE_URL/setup-netbird.sh"
 USB_WD_URL="$RAW_BASE_URL/usb-watchdog-setup.sh"
+PING_TARGET="api.telegram.org"
+PING_INTERVAL=5
+
+wait_for_network() {
+    echo "Menunggu koneksi internet..."
+    attempt=0
+    while true; do
+        attempt=$((attempt + 1))
+        if command_exists ping; then
+            if ping -c1 -W3 "$PING_TARGET" >/dev/null 2>&1; then
+                echo "Koneksi internet tersedia."
+                return 0
+            fi
+        elif command_exists wget; then
+            if wget -q --spider "https://$PING_TARGET" >/dev/null 2>&1; then
+                echo "Koneksi internet tersedia."
+                return 0
+            fi
+        elif command_exists curl; then
+            if curl -fsI "https://$PING_TARGET" >/dev/null 2>&1; then
+                echo "Koneksi internet tersedia."
+                return 0
+            fi
+        else
+            echo "[PERINGATAN] Tidak ada utilitas pengecekan internet (ping/wget/curl)." >&2
+            return 1
+        fi
+        printf '  Menunggu koneksi (percobaan %s)...\n' "$attempt"
+        sleep "$PING_INTERVAL"
+    done
+}
 
 # Busybox ash doesn't support functions with hyphen names
 
@@ -222,6 +253,9 @@ start_bot() {
         echo "[ERR] python3 tidak ditemukan." >&2
         return 1
     fi
+    if ! wait_for_network; then
+        echo "[PERINGATAN] Gagal memastikan koneksi internet. Mencoba menjalankan bot tetap." >&2
+    fi
     ensure_directory "$INSTALL_DIR"
     cd "$INSTALL_DIR" || return 1
     if nohup python3 "$BOT_SCRIPT" >>"$LOG_FILE" 2>&1 & then
@@ -276,6 +310,41 @@ INSTALL_DIR="/opt/ranet-bot"
 BOT_SCRIPT="$INSTALL_DIR/ra-bot.py"
 PID_FILE="$INSTALL_DIR/ra-bot.pid"
 LOG_FILE="$INSTALL_DIR/ra-bot.log"
+PING_TARGET="api.telegram.org"
+PING_INTERVAL=5
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+wait_for_network() {
+    echo "Menunggu koneksi internet..."
+    attempt=0
+    while true; do
+        attempt=$((attempt + 1))
+        if command_exists ping; then
+            if ping -c1 -W3 "$PING_TARGET" >/dev/null 2>&1; then
+                echo "Koneksi internet tersedia."
+                return 0
+            fi
+        elif command_exists wget; then
+            if wget -q --spider "https://$PING_TARGET" >/dev/null 2>&1; then
+                echo "Koneksi internet tersedia."
+                return 0
+            fi
+        elif command_exists curl; then
+            if curl -fsI "https://$PING_TARGET" >/dev/null 2>&1; then
+                echo "Koneksi internet tersedia."
+                return 0
+            fi
+        else
+            echo "Tidak ada utilitas pengecekan koneksi." >&2
+            return 1
+        fi
+        printf '  Menunggu koneksi (percobaan %s)...\n' "$attempt"
+        sleep "$PING_INTERVAL"
+    done
+}
 
 start_service() {
     [ -f "$BOT_SCRIPT" ] || return 1
@@ -285,6 +354,7 @@ start_service() {
             return 0
         fi
     fi
+    wait_for_network || echo "Tidak dapat memastikan koneksi internet." >&2
     nohup python3 "$BOT_SCRIPT" >>"$LOG_FILE" 2>&1 &
     echo $! >"$PID_FILE"
 }
