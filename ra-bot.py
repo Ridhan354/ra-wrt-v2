@@ -41,7 +41,7 @@ from telegram.ext import (
 
 )
 
-from telegram.error import NetworkError  # noqa: F401
+from telegram.error import NetworkError, RetryAfter, TimedOut
 
 
 
@@ -366,6 +366,31 @@ def run_shell(cmd: str, timeout: Optional[int] = None) -> str:
     except Exception as e:
 
         return f"[ERR] {e}"
+
+
+async def telegram_call_with_retry(fn, *args, retries: int = 3, retry_delay: float = 3.0, **kwargs):
+
+    attempt = 0
+
+    while True:
+
+        try:
+
+            return await fn(*args, **kwargs)
+
+        except RetryAfter as exc:
+
+            await asyncio.sleep(float(getattr(exc, "retry_after", 1)) + 1.0)
+
+        except (TimedOut, NetworkError):
+
+            attempt += 1
+
+            if attempt > retries:
+
+                raise
+
+            await asyncio.sleep(retry_delay * attempt)
 
 
 def usb_watchdog_available() -> bool:
@@ -3027,6 +3052,10 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
         return latency, jitter, down, up, loss, url, out
 
 
+async def run_speedtest_and_parse_async(server_id: Optional[str] = None) -> Tuple[float,float,float,float,float,str,str]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, run_speedtest_and_parse, server_id)
+
 
 def format_speedtest_entry(idx:int, ts:int, lat:float, jit:float, down:float, up:float, loss:float, url:str) -> str:
 
@@ -3763,11 +3792,87 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "SPD_NOW":
 
-        waiting = await query.message.reply_text("Menjalankan speedtest... mohon tunggu ±20–90 detik.")
+        waiting = None
+
+        try:
+
+            waiting = await telegram_call_with_retry(
+
+                query.message.reply_text,
+
+                "Menjalankan speedtest... mohon tunggu ±20–90 detik.",
+
+            )
+
+        except (TimedOut, NetworkError) as exc:
+
+            print(f"[WARN] Gagal mengirim pesan awal speedtest: {exc}")
+
+        except Exception as exc:
+
+            print(f"[WARN] Gagal mengirim pesan awal speedtest: {exc}")
 
         sid = settings_get("speedtest_server_id", "")
 
-        lat, jit, down, up, loss, url, _raw = run_speedtest_and_parse(sid if sid else None)
+        error_msg = None
+
+        try:
+
+            lat, jit, down, up, loss, url, _raw = await run_speedtest_and_parse_async(sid if sid else None)
+
+        except Exception as exc:
+
+            error_msg = f"[ERR] Speedtest gagal: {exc}"
+
+        finally:
+
+            if waiting is not None:
+
+                with contextlib.suppress(Exception):
+
+                    await waiting.delete()
+
+        if error_msg:
+
+            try:
+
+                await telegram_call_with_retry(
+
+                    query.message.reply_text,
+
+                    error_msg,
+
+                    reply_markup=speedtest_menu_keyboard(),
+
+                )
+
+            except Exception as exc:
+
+                print(f"[WARN] Gagal mengirim pesan error speedtest: {exc}")
+
+            return
+
+        raw_clean = _raw.strip()
+
+        if raw_clean.startswith("[ERR]"):
+
+            try:
+
+                await telegram_call_with_retry(
+
+                    query.message.reply_text,
+
+                    raw_clean,
+
+                    reply_markup=speedtest_menu_keyboard(),
+
+                )
+
+            except Exception as exc:
+
+                print(f"[WARN] Gagal mengirim hasil error speedtest: {exc}")
+
+            return
 
         ts = int(time.time())
 
@@ -3779,11 +3884,27 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             pass
 
-        await waiting.delete()
-
         result_text = build_speedtest_result_text(ts, lat, jit, down, up, loss, url)
 
-        await query.message.reply_text(result_text, parse_mode="Markdown", reply_markup=speedtest_menu_keyboard()); return
+        try:
+
+            await telegram_call_with_retry(
+
+                query.message.reply_text,
+
+                result_text,
+
+                parse_mode="Markdown",
+
+                reply_markup=speedtest_menu_keyboard(),
+
+            )
+
+        except Exception as exc:
+
+            print(f"[WARN] Gagal mengirim hasil speedtest: {exc}")
+
+        return
 
 
 
