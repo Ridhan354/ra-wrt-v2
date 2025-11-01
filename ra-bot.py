@@ -372,6 +372,8 @@ async def telegram_call_with_retry(fn, *args, retries: int = 3, retry_delay: flo
 
     attempt = 0
 
+    fn_name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None) or repr(fn)
+
     while True:
 
         try:
@@ -380,13 +382,21 @@ async def telegram_call_with_retry(fn, *args, retries: int = 3, retry_delay: flo
 
         except RetryAfter as exc:
 
-            await asyncio.sleep(float(getattr(exc, "retry_after", 1)) + 1.0)
+            delay = float(getattr(exc, "retry_after", 1)) + 1.0
 
-        except (TimedOut, NetworkError):
+            print(f"[WARN] Telegram retry-after {fn_name}: tunggu {delay:.1f}s")
+
+            await asyncio.sleep(delay)
+
+        except (TimedOut, NetworkError) as exc:
 
             attempt += 1
 
+            print(f"[WARN] Telegram call {fn_name} percobaan {attempt}/{retries + 1} gagal: {exc}")
+
             if attempt > retries:
+
+                print(f"[ERR] Telegram call {fn_name} gagal total setelah {attempt} percobaan: {exc}")
 
                 raise
 
@@ -2987,11 +2997,14 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
 
     if mode == "ookla":
 
-        cmd = bin_name
+        cmd_parts = [shlex.quote(bin_name), "--progress=no", "--accept-license", "--accept-gdpr", "--share"]
 
-        if server_id: cmd = f"{bin_name} --server-id {server_id}"
+        if server_id:
+            cmd_parts.extend(["--server-id", shlex.quote(str(server_id))])
 
-        out = run_cmd(cmd, timeout=120)
+        cmd = " ".join(cmd_parts)
+
+        out = run_cmd(cmd, timeout=180)
 
         lat_pat = re.search(r"(?:Idle\s+)?Latency:\s*([0-9.]+)\s*ms\s*\(jitter:\s*([0-9.]+)ms", out)
 
@@ -3021,11 +3034,22 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
 
         url = url_pat.group(1) if url_pat else ""
 
+        if not url:
+
+            print("[WARN] Speedtest Ookla tidak mengembalikan Result URL (mungkin share gagal)")
+
         return latency, jitter, down, up, loss, url, out
 
     else:
 
-        out = run_cmd(bin_name, timeout=180)
+        cmd_parts = [shlex.quote(bin_name), "--share"]
+
+        if server_id:
+            cmd_parts.extend(["--server", shlex.quote(str(server_id))])
+
+        cmd = " ".join(cmd_parts)
+
+        out = run_cmd(cmd, timeout=210)
 
         lat_pat = re.search(r"Latency:\s*([0-9.]+)\s*ms", out) or re.search(r"Ping:\s*([0-9.]+)\s*ms", out)
 
@@ -3048,6 +3072,10 @@ def run_speedtest_and_parse(server_id: Optional[str] = None) -> Tuple[float,floa
         url_pat = re.search(r"Result\s*URL:\s*(\S+)", out) or re.search(r"Share results:\s*(\S+)", out)
 
         url = url_pat.group(1) if url_pat else ""
+
+        if not url:
+
+            print("[WARN] Speedtest CLI tidak mengembalikan Result URL (mungkin upload share gagal)")
 
         return latency, jitter, down, up, loss, url, out
 
