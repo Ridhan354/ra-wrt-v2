@@ -19,7 +19,7 @@ RAW_BASE_URL="https://raw.githubusercontent.com/Ridhan354/ra-wrt-v2/main"
 BOT_UPDATE_URL="$RAW_BASE_URL/ra-bot.py"
 SETUP_NETBIRD_URL="$RAW_BASE_URL/setup-netbird.sh"
 USB_WD_URL="$RAW_BASE_URL/usb-watchdog-setup.sh"
-PING_TARGET="api.telegram.org"
+PING_TARGET="google.com"
 PING_INTERVAL=5
 
 wait_for_network() {
