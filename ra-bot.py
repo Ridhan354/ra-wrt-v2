@@ -317,7 +317,7 @@ BOT_UPDATE_URL = os.getenv(
 
     "RANET_BOT_UPDATE_URL",
 
-    "https://raw.githubusercontent.com/Ridhan354/ra-bot/main/ra-botV23.py",
+    "https://raw.githubusercontent.com/Ridhan354/ra-wrt-v2/main/ra-bot.py",
 
 )
 
