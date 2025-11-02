@@ -65,6 +65,9 @@ SPEEDTEST_BIN_ENV = os.getenv("SPEEDTEST_BIN", "").strip()
 _OOKLA_SHARE_UNSUPPORTED = False
 
 
+HOSTNAME_SEGMENT_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
 def _note_ookla_share_unsupported() -> None:
     global _OOKLA_SHARE_UNSUPPORTED
     if not _OOKLA_SHARE_UNSUPPORTED:
@@ -1084,6 +1087,108 @@ def get_openwrt_syscfg() -> Tuple[Optional[str], Optional[str]]:
 
     return hn, zn
 
+
+
+def _validate_hostname(name: str) -> Optional[str]:
+
+    if not name:
+        return "Hostname tidak boleh kosong."
+
+    if len(name) > 253:
+        return "Hostname terlalu panjang (maksimal 253 karakter)."
+
+    parts = name.split('.')
+
+    for part in parts:
+
+        if not part:
+            return "Hostname tidak boleh diawali/diakhiri titik atau memiliki dua titik berurutan."
+
+        if not HOSTNAME_SEGMENT_RE.match(part):
+
+            return "Hostname hanya boleh berisi huruf, angka, atau tanda minus (tidak diawali/diakhiri minus)."
+
+    return None
+
+
+def get_current_hostname() -> Optional[str]:
+
+    hn, _ = get_openwrt_syscfg()
+
+    if hn:
+
+        return hn
+
+    out = run_cmd("uci get system.@system[0].hostname")
+
+    if out and not out.startswith("[ERR]"):
+
+        first_line = out.strip().splitlines()[0]
+
+        if first_line:
+
+            return first_line
+
+    try:
+
+        return os.uname().nodename
+
+    except AttributeError:
+
+        return None
+
+
+def apply_hostname_change(new_hostname: str) -> Tuple[bool, str, Optional[str]]:
+
+    new_hostname = new_hostname.strip()
+
+    err = _validate_hostname(new_hostname)
+
+    if err:
+
+        return False, err, None
+
+    steps = [
+
+        ("uci set hostname", f"uci set system.@system[0].hostname={shlex.quote(new_hostname)}"),
+
+        ("uci commit system", "uci commit system"),
+
+        ("hostname runtime", f"hostname {shlex.quote(new_hostname)}"),
+
+    ]
+
+    for label, cmd in steps:
+
+        out = run_cmd(cmd)
+
+        if out.startswith("[ERR]"):
+
+            return False, f"{label} gagal:\n{out}", None
+
+    warning = None
+
+    details: List[str] = []
+
+    reload_out = run_cmd("/etc/init.d/system reload")
+
+    if reload_out.startswith("[ERR]"):
+
+        warning = reload_out
+
+        alt = run_cmd("reload_config")
+
+        if not alt.startswith("[ERR]") and alt:
+
+            details.append(alt)
+
+    elif reload_out:
+
+        details.append(reload_out)
+
+    info = "\n".join(details).strip()
+
+    return True, info, warning
 
 
 def get_os_firmware() -> str:
@@ -2154,6 +2259,7 @@ PROMPT_KEYS_BOOL = {
     "await_scheduler_action",
     "await_power_custom",
     "await_usbwd_config",
+    "await_hostname_edit",
 }
 
 PROMPT_KEYS_VALUE = {
@@ -2230,6 +2336,7 @@ def iface_menu() -> InlineKeyboardMarkup:
 def system_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("ℹ️ Info", callback_data="SYS_INFO")],
+        [InlineKeyboardButton("📝 Edit Hostname", callback_data="SYS_HOSTNAME")],
         [InlineKeyboardButton("🔌 Reboot / Shutdown", callback_data="MENU_SYS_POWER")],
         [InlineKeyboardButton("🧠 Processes", callback_data="MENU_PROCESS")],
         [InlineKeyboardButton("🧾 Logs", callback_data="MENU_SYS_LOGS")],
@@ -3513,6 +3620,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for chunk in split_chunks(info):
             await query.message.reply_text(code_block(chunk), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=system_info_keyboard())
         return
+    if data == "SYS_HOSTNAME":
+        ctx.user_data["await_hostname_edit"] = True
+        current = get_current_hostname() or "-"
+        prompt = (
+            "📝 *Ubah Hostname*\n"
+            f"Hostname saat ini: `{mdv2_escape(current)}`\n"
+            "Kirim hostname baru (huruf/angka/tanda minus, boleh gunakan titik untuk domain).\n"
+            "Balas 'batal' untuk membatalkan."
+        )
+        await query.message.reply_text(prompt, parse_mode=ParseMode.MARKDOWN_V2)
+        return
     if data == "MENU_SYS_POWER":
         await query.edit_message_text("🔌 *Reboot / Shutdown*", parse_mode="Markdown", reply_markup=power_menu_keyboard()); return
     if data.startswith("SYS_REBOOT:"):
@@ -4577,6 +4695,26 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 
+
+    if ctx.user_data.get("await_hostname_edit"):
+        raw = text.strip()
+        if raw.lower() in {"batal", "cancel", "stop", "keluar"}:
+            ctx.user_data["await_hostname_edit"] = False
+            await update.message.reply_text("❌ Perubahan hostname dibatalkan.")
+            return
+        ctx.user_data["await_hostname_edit"] = False
+        success, info, warning = apply_hostname_change(raw)
+        if not success:
+            await update.message.reply_text(f"❌ {info}")
+            return
+        escaped = mdv2_escape(raw)
+        lines = [f"✅ Hostname berhasil diubah menjadi `{escaped}`."]
+        if warning:
+            lines.append(f"⚠️ {mdv2_escape(warning)}")
+        if info:
+            lines.append(code_block(info))
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+        return
 
     # Await netbird ganti-ip
 
