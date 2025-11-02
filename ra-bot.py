@@ -67,6 +67,8 @@ _OOKLA_SHARE_UNSUPPORTED = False
 
 HOSTNAME_SEGMENT_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
+BOT_LOG_PATH = os.getenv("RANET_BOT_LOG_FILE", "/opt/ranet-bot/ra-bot.log")
+
 
 def _note_ookla_share_unsupported() -> None:
     global _OOKLA_SHARE_UNSUPPORTED
@@ -414,6 +416,46 @@ async def telegram_call_with_retry(fn, *args, retries: int = 3, retry_delay: flo
                 raise
 
             await asyncio.sleep(retry_delay * attempt)
+
+
+async def safe_reply_text(message, text, **kwargs):
+    if message is None:
+        return None
+    try:
+        return await telegram_call_with_retry(message.reply_text, text, **kwargs)
+    except Exception as exc:
+        print(f"[ERR] Telegram reply_text gagal: {exc}")
+        return None
+
+
+async def safe_send_message(app, chat_id: Optional[int], text, **kwargs):
+    if chat_id is None or app is None:
+        print("[ERR] Tidak dapat mengirim pesan: chat_id atau aplikasi Telegram tidak tersedia.")
+        return None
+    bot = getattr(app, "bot", None)
+    if bot is None:
+        print("[ERR] Telegram bot instance tidak tersedia untuk mengirim pesan.")
+        return None
+    try:
+        return await telegram_call_with_retry(bot.send_message, chat_id=chat_id, text=text, **kwargs)
+    except Exception as exc:
+        print(f"[ERR] Telegram send_message gagal: {exc}")
+        return None
+
+
+async def send_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
+    message = None
+    if update.callback_query and update.callback_query.message:
+        message = update.callback_query.message
+    elif update.message:
+        message = update.message
+    result = None
+    if message is not None:
+        result = await safe_reply_text(message, text, **kwargs)
+    if result is not None:
+        return result
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    return await safe_send_message(ctx.application, chat_id, text, **kwargs)
 
 
 def usb_watchdog_available() -> bool:
@@ -2337,6 +2379,7 @@ def system_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("ℹ️ Info", callback_data="SYS_INFO")],
         [InlineKeyboardButton("📝 Edit Hostname", callback_data="SYS_HOSTNAME")],
+        [InlineKeyboardButton("📜 Log Bot", callback_data="SYS_BOT_LOG")],
         [InlineKeyboardButton("🔌 Reboot / Shutdown", callback_data="MENU_SYS_POWER")],
         [InlineKeyboardButton("🧠 Processes", callback_data="MENU_PROCESS")],
         [InlineKeyboardButton("🧾 Logs", callback_data="MENU_SYS_LOGS")],
@@ -2740,6 +2783,11 @@ def log_kernel_tail() -> str:
 
 def log_dmesg_tail() -> str:
     return run_cmd("dmesg | tail -n 200")
+
+def bot_log_tail() -> str:
+    if not os.path.exists(BOT_LOG_PATH):
+        return f"[ERR] Log bot tidak ditemukan di {BOT_LOG_PATH}"
+    return run_cmd(f"tail -n 200 {shlex.quote(BOT_LOG_PATH)}")
 
 def log_search(term: str) -> str:
     if not term:
@@ -3629,7 +3677,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Kirim hostname baru (huruf/angka/tanda minus, boleh gunakan titik untuk domain).\n"
             "Balas 'batal' untuk membatalkan."
         )
-        await query.message.reply_text(prompt, parse_mode=ParseMode.MARKDOWN_V2)
+        await send_text(update, ctx, prompt, parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    if data == "SYS_BOT_LOG":
+        log_output = bot_log_tail()
+        chunks = list(split_chunks(log_output)) or ["(log kosong)"]
+        for chunk in chunks:
+            await send_text(
+                update,
+                ctx,
+                code_block(chunk),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
         return
     if data == "MENU_SYS_POWER":
         await query.edit_message_text("🔌 *Reboot / Shutdown*", parse_mode="Markdown", reply_markup=power_menu_keyboard()); return
@@ -4700,12 +4759,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         raw = text.strip()
         if raw.lower() in {"batal", "cancel", "stop", "keluar"}:
             ctx.user_data["await_hostname_edit"] = False
-            await update.message.reply_text("❌ Perubahan hostname dibatalkan.")
+            await send_text(update, ctx, "❌ Perubahan hostname dibatalkan.")
             return
         ctx.user_data["await_hostname_edit"] = False
         success, info, warning = apply_hostname_change(raw)
         if not success:
-            await update.message.reply_text(f"❌ {info}")
+            await send_text(update, ctx, f"❌ {info}")
             return
         escaped = mdv2_escape(raw)
         lines = [f"✅ Hostname berhasil diubah menjadi `{escaped}`."]
@@ -4713,7 +4772,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lines.append(f"⚠️ {mdv2_escape(warning)}")
         if info:
             lines.append(code_block(info))
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+        await send_text(update, ctx, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
     # Await netbird ganti-ip
