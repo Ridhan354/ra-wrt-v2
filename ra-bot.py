@@ -23,10 +23,11 @@ IP/ISP multi-fallback (curl/wget/uclient-fetch/urllib). Memory dari `free` (MB).
 import os, re, shlex, subprocess, glob, sqlite3, time, math, urllib.request, urllib.parse
 import sys, asyncio, tempfile, json, stat, contextlib
 from datetime import datetime, timezone, timedelta, time as dtime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 from pathlib import Path
 import shutil, errno  # — PATCH: untuk copy fallback EXDEV
+from dataclasses import dataclass, field
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -580,6 +581,1323 @@ def allowed(update: Update) -> bool:
 
     return (uid in ALLOWED_IDS)
 
+
+
+# ------------------ ANDROID SUPPORT ------------------
+
+
+@dataclass
+class AndroidDevice:
+
+    serial: str
+
+    status: str
+
+    model: str = ""
+
+    product: str = ""
+
+    device: str = ""
+
+    transport_id: str = ""
+
+    extra: Dict[str, str] = field(default_factory=dict)
+
+    raw: str = ""
+
+
+@dataclass
+class AndroidSMS:
+
+    ts_ms: Optional[int]
+
+    address: str
+
+    body: str
+
+    raw_ts: str = ""
+
+
+ANDROID_SMS_DB_PATHS = [
+
+    "/data/data/com.android.providers.telephony/databases/mmssms.db",
+
+    "/data/user_de/0/com.android.providers.telephony/databases/mmssms.db",
+
+]
+
+
+def android_adb_available() -> bool:
+
+    return shutil.which("adb") is not None
+
+
+def android_exec(device: Optional[str], *args: str, timeout: Optional[int] = None) -> str:
+
+    cmd = ["adb"]
+
+    if device:
+
+        cmd.extend(["-s", device])
+
+    cmd.extend(args)
+
+    try:
+
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=timeout or CMD_TIMEOUT)
+
+        return out.decode("utf-8", errors="replace").strip()
+
+    except subprocess.CalledProcessError as exc:
+
+        detail = exc.output.decode("utf-8", errors="replace").strip()
+
+        return f"[ERR] {detail or exc}"
+
+    except subprocess.TimeoutExpired:
+
+        return f"[ERR] adb timeout after {(timeout or CMD_TIMEOUT)}s"
+
+    except FileNotFoundError:
+
+        return "[ERR] adb tidak ditemukan di PATH"
+
+    except Exception as exc:
+
+        return f"[ERR] {exc}"
+
+
+def android_shell(device: str, *cmd: str, timeout: Optional[int] = None) -> str:
+
+    return android_exec(device, "shell", *cmd, timeout=timeout)
+
+
+def android_shell_root(device: str, command: str, timeout: Optional[int] = None) -> str:
+
+    return android_exec(device, "shell", "su", "-c", command, timeout=timeout)
+
+
+def android_list_devices() -> List[AndroidDevice]:
+
+    out = android_exec(None, "devices", "-l")
+
+    if not out or out.startswith("[ERR]"):
+
+        return []
+
+    devices: List[AndroidDevice] = []
+
+    for raw in out.splitlines():
+
+        line = raw.strip()
+
+        if not line or line.lower().startswith("list of devices"):
+
+            continue
+
+        parts = line.split()
+
+        if len(parts) < 2:
+
+            continue
+
+        serial, status = parts[0], parts[1]
+
+        extras: Dict[str, str] = {}
+
+        for piece in parts[2:]:
+
+            if ":" in piece:
+
+                k, v = piece.split(":", 1)
+
+                extras[k] = v
+
+        devices.append(AndroidDevice(
+
+            serial=serial,
+
+            status=status,
+
+            model=extras.get("model", ""),
+
+            product=extras.get("product", ""),
+
+            device=extras.get("device", ""),
+
+            transport_id=extras.get("transport_id", ""),
+
+            extra=extras,
+
+            raw=line,
+
+        ))
+
+    return devices
+
+
+def android_device_label(dev: AndroidDevice) -> str:
+
+    base = dev.model or dev.product or dev.device or dev.extra.get("product", "") or "-"
+
+    if dev.status and dev.status != "device":
+
+        return f"{base} ({dev.status})"
+
+    return base
+
+
+def android_choice_label(dev: AndroidDevice) -> str:
+
+    base = android_device_label(dev)
+
+    if base == "-":
+
+        return dev.serial
+
+    label = f"{dev.serial} · {base}"
+
+    return label if len(label) <= 60 else f"{label[:57]}…"
+
+
+def android_selected_device(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+
+    if ctx.application:
+
+        return ctx.application.bot_data.get("android_device")
+
+    return None
+
+
+def android_selected_label(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+
+    if ctx.application:
+
+        return ctx.application.bot_data.get("android_device_label")
+
+    return None
+
+
+def android_set_selected_device(ctx: ContextTypes.DEFAULT_TYPE, serial: str, label: str) -> None:
+
+    if ctx.application:
+
+        ctx.application.bot_data["android_device"] = serial
+
+        ctx.application.bot_data["android_device_label"] = label
+
+
+def android_clear_selected_device(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+
+    if ctx.application:
+
+        ctx.application.bot_data.pop("android_device", None)
+
+        ctx.application.bot_data.pop("android_device_label", None)
+
+
+def android_resolve_selection(ctx: ContextTypes.DEFAULT_TYPE, devices: List[AndroidDevice]) -> Tuple[Optional[str], Optional[str]]:
+
+    selected = android_selected_device(ctx)
+
+    label = android_selected_label(ctx)
+
+    if not selected:
+
+        return None, None
+
+    for dev in devices:
+
+        if dev.serial == selected and dev.status == "device":
+
+            if not label:
+
+                label = android_device_label(dev)
+
+                android_set_selected_device(ctx, selected, label)
+
+            return selected, label
+
+    android_clear_selected_device(ctx)
+
+    return None, None
+
+
+def android_ensure_selection(ctx: ContextTypes.DEFAULT_TYPE, devices: List[AndroidDevice]) -> Tuple[Optional[str], Optional[str]]:
+
+    selected, label = android_resolve_selection(ctx, devices)
+
+    if selected:
+
+        return selected, label
+
+    ready = [dev for dev in devices if dev.status == "device"]
+
+    if len(ready) == 1:
+
+        dev = ready[0]
+
+        label = android_device_label(dev)
+
+        android_set_selected_device(ctx, dev.serial, label)
+
+        return dev.serial, label
+
+    return None, None
+
+
+def android_device_ready(serial: str) -> bool:
+
+    state = android_exec(serial, "get-state")
+
+    return bool(state) and (not state.startswith("[ERR]")) and (state.strip() == "device")
+
+
+def android_has_root(serial: str) -> bool:
+
+    res = android_exec(serial, "shell", "su", "-c", "id")
+
+    return bool(res) and (not res.startswith("[ERR]")) and ("uid=0" in res)
+
+
+def android_getprop(serial: str, prop: str) -> str:
+
+    out = android_shell(serial, "getprop", prop)
+
+    if not out or out.startswith("[ERR]"):
+
+        return ""
+
+    return out.strip()
+
+
+def android_sdk(serial: str) -> Optional[int]:
+
+    val = android_getprop(serial, "ro.build.version.sdk")
+
+    try:
+
+        return int(val)
+
+    except (TypeError, ValueError):
+
+        return None
+
+
+def android_fmt_duration(seconds: int) -> str:
+
+    d, rem = divmod(max(0, int(seconds)), 86400)
+
+    h, rem = divmod(rem, 3600)
+
+    m, s = divmod(rem, 60)
+
+    return f"{d}d {h:02d}:{m:02d}:{s:02d}"
+
+
+def android_uptime_value(serial: str) -> str:
+
+    out = android_shell(serial, "cat", "/proc/uptime")
+
+    if not out or out.startswith("[ERR]"):
+
+        return "?"
+
+    try:
+
+        secs = int(float(out.split()[0]))
+
+    except (ValueError, IndexError):
+
+        return "?"
+
+    return android_fmt_duration(secs)
+
+
+def android_battery_text(serial: str) -> str:
+
+    raw = android_shell(serial, "dumpsys", "battery")
+
+    if not raw or raw.startswith("[ERR]"):
+
+        return "Battery: ?"
+
+    def _val(key: str) -> Optional[str]:
+
+        m = re.search(rf"{re.escape(key)}:\s*(\S+)", raw)
+
+        return m.group(1) if m else None
+
+    level = _val("level") or "?"
+
+    status_code = _val("status") or "0"
+
+    status_map = {"2": "Charging", "3": "Discharging", "4": "Not charging", "5": "Full"}
+
+    status = status_map.get(status_code, "Unknown")
+
+    temp_raw = _val("temperature") or ""
+
+    temp_text = "?"
+
+    if temp_raw:
+
+        try:
+
+            val = int(temp_raw)
+
+            if val > 1000:
+
+                temp_text = f"{val / 1000:.1f}"
+
+            else:
+
+                temp_text = f"{val / 10:.1f}"
+
+        except ValueError:
+
+            temp_text = temp_raw
+
+    volt = _val("voltage") or "?"
+
+    return f"Battery: {level}% ({status}), Temp: {temp_text}°C, Volt: {volt} mV"
+
+
+def android_airplane_status(serial: str) -> Tuple[str, Optional[bool], str]:
+
+    out = android_shell(serial, "cmd", "connectivity", "airplane-mode")
+
+    if out and not out.startswith("[ERR]"):
+
+        m = re.search(r"enabled:?\s*(\w+)", out)
+
+        if m:
+
+            val = m.group(1).strip().lower()
+
+            if val in {"true", "false"}:
+
+                return "new", (val == "true"), out
+
+    legacy = android_shell(serial, "settings", "get", "global", "airplane_mode_on")
+
+    if legacy and not legacy.startswith("[ERR]"):
+
+        val = legacy.strip()
+
+        if val == "1":
+
+            return "legacy", True, legacy
+
+        if val == "0":
+
+            return "legacy", False, legacy
+
+    return "unknown", None, out or legacy or ""
+
+
+def android_mobile_data_status(serial: str) -> Tuple[Optional[bool], str]:
+
+    out = android_shell(serial, "settings", "get", "global", "mobile_data")
+
+    if out and not out.startswith("[ERR]"):
+
+        val = out.strip()
+
+        if val == "1":
+
+            return True, out
+
+        if val == "0":
+
+            return False, out
+
+    return None, out or ""
+
+
+def android_network_text(serial: str) -> str:
+
+    operator = android_getprop(serial, "gsm.sim.operator.alpha") or "?"
+
+    network = android_getprop(serial, "gsm.network.type") or "?"
+
+    route_raw = android_shell(serial, "ip", "route")
+
+    if not route_raw or route_raw.startswith("[ERR]"):
+
+        route_raw = android_shell(serial, "ip", "route", "show")
+
+    route_line = "?"
+
+    if route_raw and not route_raw.startswith("[ERR]"):
+
+        for ln in route_raw.splitlines():
+
+            ln = ln.strip()
+
+            if ln:
+
+                route_line = ln
+
+                break
+
+    return f"Operator: {operator} | RAT: {network}\nRoute: {route_line}"
+
+
+def android_memory_text(serial: str) -> str:
+
+    raw = android_shell(serial, "cat", "/proc/meminfo")
+
+    if not raw or raw.startswith("[ERR]"):
+
+        return raw or "?"
+
+    def _extract(key: str) -> Optional[str]:
+
+        m = re.search(rf"{key}:\s*(\d+)\s*(\w+)?", raw)
+
+        if m:
+
+            val, unit = m.group(1), m.group(2) or ""
+
+            return f"{val} {unit}".strip()
+
+        return None
+
+    total = _extract("MemTotal") or "?"
+
+    avail = _extract("MemAvailable") or "?"
+
+    return f"total={total}, available={avail}"
+
+
+def android_storage_info_lines(serial: str) -> Tuple[str, List[str]]:
+
+    raw = android_shell(serial, "dumpsys", "diskstats")
+
+    if raw and not raw.startswith("[ERR]"):
+
+        lines = [ln.rstrip() for ln in raw.splitlines()[:15]]
+
+        return "Storage (diskstats)", lines
+
+    raw = android_shell(serial, "df", "-h", "/data")
+
+    if raw and not raw.startswith("[ERR]"):
+
+        return "Storage (df -h /data)", [ln.rstrip() for ln in raw.splitlines()]
+
+    return "Storage", [(raw or "(tidak tersedia)").strip()]
+
+
+def android_process_lines(serial: str) -> List[str]:
+
+    raw = android_shell(serial, "ps", "-eo", "pid,user,%cpu,%mem,cmd,time+")
+
+    if not raw or raw.startswith("[ERR]"):
+
+        raw = android_shell(serial, "ps")
+
+    if not raw or raw.startswith("[ERR]"):
+
+        return [(raw or "(tidak tersedia)").strip()]
+
+    return [ln.rstrip() for ln in raw.splitlines()[:15]]
+
+
+def android_signal_strength_text(serial: str) -> str:
+
+    raw = android_shell(serial, "dumpsys", "telephony.registry")
+
+    if not raw or raw.startswith("[ERR]"):
+
+        return raw or "Signal: unknown"
+
+    for ln in raw.splitlines():
+
+        if "mSignalStrength=SignalStrength" in ln:
+
+            part = ln.split("mSignalStrength=SignalStrength:", 1)[-1].strip()
+
+            return f"Signal: {part}" if part else "Signal: unknown"
+
+    return "Signal: unknown"
+
+
+def android_collect_info(serial: str) -> Dict[str, Any]:
+
+    info: Dict[str, Any] = {
+
+        "serial": serial,
+
+        "model": android_getprop(serial, "ro.product.model") or "-",
+
+        "product": android_getprop(serial, "ro.product.name") or "-",
+
+        "android_version": android_getprop(serial, "ro.build.version.release") or "?",
+
+    }
+
+    sdk_int = android_sdk(serial)
+
+    info["sdk_int"] = sdk_int
+
+    info["sdk_text"] = str(sdk_int) if sdk_int is not None else "?"
+
+    info["uptime"] = android_uptime_value(serial)
+
+    info["battery_text"] = android_battery_text(serial)
+
+    mode, enabled, _ = android_airplane_status(serial)
+
+    if mode == "new":
+
+        info["airplane_text"] = f"Airplane Mode: {'enabled' if enabled else 'disabled'} (new API)"
+
+    elif mode == "legacy":
+
+        info["airplane_text"] = f"Airplane Mode: {'true' if enabled else 'false'} (legacy)"
+
+    else:
+
+        info["airplane_text"] = "Airplane Mode: unknown"
+
+    mobile, _ = android_mobile_data_status(serial)
+
+    if mobile is True:
+
+        info["mobile_data_text"] = "Mobile Data: enabled"
+
+    elif mobile is False:
+
+        info["mobile_data_text"] = "Mobile Data: disabled"
+
+    else:
+
+        info["mobile_data_text"] = "Mobile Data: unknown"
+
+    info["network_text"] = android_network_text(serial)
+
+    info["memory_text"] = android_memory_text(serial)
+
+    storage_title, storage_lines = android_storage_info_lines(serial)
+
+    info["storage_title"] = storage_title
+
+    info["storage_lines"] = storage_lines
+
+    info["process_lines"] = android_process_lines(serial)
+
+    return info
+
+
+def android_summary_text(info: Dict[str, Any], label: Optional[str] = None) -> str:
+
+    display_label = label or info.get("model") or info.get("product") or "-"
+
+    lines = [
+
+        f"Device : {info.get('serial', '-') } ({display_label})",
+
+        f"Model  : {info.get('model', '-')}",
+
+        f"Product: {info.get('product', '-')}",
+
+        f"Android: {info.get('android_version', '?')} (SDK {info.get('sdk_text', '?')})",
+
+        "",
+
+        f"Uptime : {info.get('uptime', '?')}",
+
+        info.get("battery_text", "Battery: ?"),
+
+        f"{info.get('airplane_text', 'Airplane Mode: unknown')} | {info.get('mobile_data_text', 'Mobile Data: unknown')}",
+
+        info.get("network_text", "Network: ?"),
+
+        "",
+
+        "Memory:",
+
+        f"  {info.get('memory_text', '?')}",
+
+        "",
+
+        f"{info.get('storage_title', 'Storage')}:",
+
+    ]
+
+    storage_lines = info.get("storage_lines") or []
+
+    if storage_lines:
+
+        lines.extend(f"  {ln}" for ln in storage_lines)
+
+    else:
+
+        lines.append("  (tidak tersedia)")
+
+    lines.append("")
+
+    lines.append("Processes (top 15):")
+
+    proc_lines = info.get("process_lines") or []
+
+    if proc_lines:
+
+        lines.extend(f"  {ln}" for ln in proc_lines)
+
+    else:
+
+        lines.append("  (tidak tersedia)")
+
+    return "\n".join(lines)
+
+
+def android_parse_content_sms(output: str) -> List[AndroidSMS]:
+
+    entries: List[AndroidSMS] = []
+
+    if not output or output.startswith("[ERR]"):
+
+        return entries
+
+    for line in output.splitlines():
+
+        line = line.strip()
+
+        if not line or "address=" not in line or " body=" not in line:
+
+            continue
+
+        try:
+
+            addr_part = line.split("address=", 1)[1]
+
+            addr, rest = addr_part.split(" body=", 1)
+
+            body_part, rest = rest.split(" date=", 1)
+
+        except ValueError:
+
+            continue
+
+        date_raw = rest.split()[0]
+
+        address = addr.strip()
+
+        body = body_part.replace("\\n", " ").replace("\\r", " ").strip()
+
+        raw_ts = date_raw.strip()
+
+        ts_ms: Optional[int] = None
+
+        if raw_ts.isdigit():
+
+            try:
+
+                ts_ms = int(raw_ts)
+
+            except ValueError:
+
+                ts_ms = None
+
+        entries.append(AndroidSMS(ts_ms=ts_ms, address=address, body=body, raw_ts=raw_ts))
+
+    entries.sort(key=lambda sms: sms.ts_ms or 0, reverse=True)
+
+    return entries[:5]
+
+
+def android_parse_sqlite_sms(output: str) -> List[AndroidSMS]:
+
+    entries: List[AndroidSMS] = []
+
+    if not output or output.startswith("[ERR]"):
+
+        return entries
+
+    for line in output.splitlines():
+
+        if not line.strip():
+
+            continue
+
+        parts = line.split("|")
+
+        if len(parts) < 3:
+
+            continue
+
+        address, body, raw_ts = parts[0].strip(), parts[1].strip(), parts[2].strip()
+
+        ts_ms: Optional[int] = None
+
+        if raw_ts.isdigit():
+
+            try:
+
+                ts_ms = int(raw_ts)
+
+            except ValueError:
+
+                ts_ms = None
+
+        entries.append(AndroidSMS(ts_ms=ts_ms, address=address, body=body, raw_ts=raw_ts))
+
+    entries.sort(key=lambda sms: sms.ts_ms or 0, reverse=True)
+
+    return entries[:5]
+
+
+def android_content_query(serial: str, sort: bool = True) -> str:
+
+    base = "content query --user 0 --uri content://sms/inbox --projection address,body,date"
+
+    if sort:
+
+        base += ' --sort "date DESC"'
+
+    return android_shell(serial, "sh", "-c", base)
+
+
+def android_content_query_root(serial: str, sort: bool = True) -> str:
+
+    base = "content query --user 0 --uri content://sms/inbox --projection address,body,date"
+
+    if sort:
+
+        base += ' --sort "date DESC"'
+
+    return android_shell_root(serial, base)
+
+
+def android_device_has_sqlite(serial: str) -> bool:
+
+    res = android_shell_root(serial, "which sqlite3")
+
+    return bool(res) and not res.startswith("[ERR]")
+
+
+def android_sqlite_query_device(serial: str, path: str) -> List[AndroidSMS]:
+
+    cmd = f"sqlite3 '{path}' \"SELECT address, body, date FROM sms WHERE type=1 ORDER BY date DESC LIMIT 5;\""
+
+    out = android_shell_root(serial, cmd)
+
+    return android_parse_sqlite_sms(out)
+
+
+def android_sqlite_read_local(path: Path) -> List[AndroidSMS]:
+
+    entries: List[AndroidSMS] = []
+
+    conn = None
+
+    try:
+
+        conn = sqlite3.connect(path)
+
+        cur = conn.cursor()
+
+        rows = cur.execute(
+
+            "SELECT address, body, date FROM sms WHERE type=1 ORDER BY date DESC LIMIT 5;"
+
+        ).fetchall()
+
+    except Exception:
+
+        rows = []
+
+    finally:
+
+        if conn:
+
+            conn.close()
+
+    for address, body, raw_ts in rows:
+
+        text_ts = str(raw_ts)
+
+        ts_ms: Optional[int] = None
+
+        if text_ts.isdigit():
+
+            try:
+
+                ts_ms = int(text_ts)
+
+            except ValueError:
+
+                ts_ms = None
+
+        entries.append(
+
+            AndroidSMS(
+
+                ts_ms=ts_ms,
+
+                address=str(address or ""),
+
+                body=str(body or ""),
+
+                raw_ts=text_ts,
+
+            )
+
+        )
+
+    entries.sort(key=lambda sms: sms.ts_ms or 0, reverse=True)
+
+    return entries[:5]
+
+
+def android_sqlite_pull_and_query(serial: str) -> List[AndroidSMS]:
+
+    remote_tmp = "/sdcard/mmssms.db"
+
+    for src in ANDROID_SMS_DB_PATHS:
+
+        tmpdir = Path(tempfile.mkdtemp())
+
+        local_path = tmpdir / "mmssms.db"
+
+        try:
+
+            copy_cmd = (
+
+                f"cp {shlex.quote(src)} {shlex.quote(remote_tmp)} && "
+
+                f"chmod 0644 {shlex.quote(remote_tmp)}"
+
+            )
+
+            res = android_shell_root(serial, copy_cmd)
+
+            if res.startswith("[ERR]"):
+
+                continue
+
+            pull = android_exec(serial, "pull", remote_tmp, str(local_path))
+
+            if pull.startswith("[ERR]") or (not local_path.exists()):
+
+                continue
+
+            entries = android_sqlite_read_local(local_path)
+
+            if entries:
+
+                return entries
+
+        finally:
+
+            android_shell(serial, "rm", remote_tmp)
+
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return []
+
+
+def android_fetch_sms_entries(serial: str, sdk_int: Optional[int]) -> Tuple[List[AndroidSMS], Optional[str]]:
+
+    out = android_content_query(serial, sort=True)
+
+    entries = android_parse_content_sms(out)
+
+    if entries:
+
+        return entries, None
+
+    out = android_content_query(serial, sort=False)
+
+    entries = android_parse_content_sms(out)
+
+    if entries:
+
+        return entries, None
+
+    has_root = android_has_root(serial)
+
+    if has_root:
+
+        out = android_content_query_root(serial, sort=True)
+
+        entries = android_parse_content_sms(out)
+
+        if entries:
+
+            return entries, None
+
+    if sdk_int is not None and sdk_int >= 28:
+
+        if has_root:
+
+            out = android_content_query_root(serial, sort=False)
+
+            entries = android_parse_content_sms(out)
+
+            if entries:
+
+                return entries, None
+
+        return [], "Tidak bisa ambil SMS di Android ≥9 (ROM/izin?)."
+
+    if not has_root:
+
+        return [], "Butuh root untuk SMS di Android < 9."
+
+    out = android_content_query_root(serial, sort=False)
+
+    entries = android_parse_content_sms(out)
+
+    if entries:
+
+        return entries, None
+
+    if android_device_has_sqlite(serial):
+
+        for path in ANDROID_SMS_DB_PATHS:
+
+            entries = android_sqlite_query_device(serial, path)
+
+            if entries:
+
+                return entries, None
+
+    entries = android_sqlite_pull_and_query(serial)
+
+    if entries:
+
+        return entries, None
+
+    return [], "Gagal akses SMS di Android < 9 meski root. Pastikan sqlite3 tersedia (device/host)."
+
+
+def android_format_sms(entries: List[AndroidSMS]) -> str:
+
+    if not entries:
+
+        return "(Tidak ada SMS)"
+
+    lines: List[str] = []
+
+    for sms in entries:
+
+        if sms.ts_ms is not None and sms.ts_ms > 0:
+
+            try:
+
+                ts = datetime.fromtimestamp(sms.ts_ms / 1000, tz=timezone.utc).astimezone(TZ)
+
+                ts_text = ts.strftime("%Y-%m-%d %H:%M:%S")
+
+            except Exception:
+
+                ts_text = sms.raw_ts or "-"
+
+        else:
+
+            ts_text = sms.raw_ts or "-"
+
+        addr = sms.address or "-"
+
+        body = sms.body.replace("\r", " ").replace("\n", " ")
+
+        lines.append(f"{ts_text}  |  {addr}")
+
+        lines.append(f"  {body[:300]}")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def android_sms_text(serial: str, sdk_int: Optional[int]) -> Tuple[str, Optional[str]]:
+
+    entries, error = android_fetch_sms_entries(serial, sdk_int)
+
+    return android_format_sms(entries), error
+
+
+def android_toggle_airplane(serial: str) -> str:
+
+    mode, enabled, _ = android_airplane_status(serial)
+
+    if mode == "unknown":
+
+        return "❌ Tidak bisa membaca status Airplane Mode."
+
+    if mode == "new":
+
+        target = "disable" if enabled else "enable"
+
+        res = android_shell(serial, "cmd", "connectivity", "airplane-mode", target)
+
+        if res and res.startswith("[ERR]"):
+
+            return f"❌ Gagal mengubah Airplane Mode: {res}"
+
+        _, final_state, _ = android_airplane_status(serial)
+
+        if final_state is True:
+
+            return "✈️ Airplane Mode diaktifkan."
+
+        if final_state is False:
+
+            return "✈️ Airplane Mode dimatikan."
+
+        return "✈️ Airplane Mode ditoggle."
+
+    if android_has_root(serial):
+
+        if enabled:
+
+            cmd = (
+
+                "settings put global airplane_mode_on 0; "
+
+                "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false"
+
+            )
+
+        else:
+
+            cmd = (
+
+                "settings put global airplane_mode_on 1; "
+
+                "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true"
+
+            )
+
+        res = android_shell_root(serial, cmd)
+
+        if res and res.startswith("[ERR]"):
+
+            return f"❌ Gagal mengubah Airplane Mode: {res}"
+
+        _, final_state, _ = android_airplane_status(serial)
+
+        if final_state is True:
+
+            return "✈️ Airplane Mode diaktifkan (legacy)."
+
+        if final_state is False:
+
+            return "✈️ Airplane Mode dimatikan (legacy)."
+
+        return "✈️ Airplane Mode ditoggle (legacy)."
+
+    target = "0" if enabled else "1"
+
+    res = android_shell(serial, "settings", "put", "global", "airplane_mode_on", target)
+
+    if res and res.startswith("[ERR]"):
+
+        return f"❌ Gagal mengubah Airplane Mode: {res}"
+
+    return "⚠️ Airplane Mode ditoggle tanpa root (mungkin tidak persist)."
+
+
+def android_toggle_mobile_data(serial: str) -> str:
+
+    current, _ = android_mobile_data_status(serial)
+
+    disable = current is True
+
+    action = "disable" if disable else "enable"
+
+    res = android_shell(serial, "svc", "data", action)
+
+    if res and (res.startswith("[ERR]") or "Permission" in res or "ecurity" in res):
+
+        if android_has_root(serial):
+
+            res = android_shell_root(serial, f"svc data {action}")
+
+        else:
+
+            return f"❌ Gagal mengubah mobile data: {res or 'akses ditolak'}"
+
+    if res and res.startswith("[ERR]"):
+
+        return f"❌ Gagal mengubah mobile data: {res}"
+
+    final, _ = android_mobile_data_status(serial)
+
+    if final is True:
+
+        return "📶 Mobile data diaktifkan."
+
+    if final is False:
+
+        return "📶 Mobile data dimatikan."
+
+    return "📶 Mobile data ditoggle, status akhir tidak diketahui."
+
+
+def android_safe_serial(serial: str) -> str:
+
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", serial or "device")
+
+
+def android_export_report(serial: str, info: Dict[str, Any], sms_text: str) -> Path:
+
+    reports_dir = Path("reports")
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now(tz=TZ).strftime("%Y%m%d-%H%M%S")
+
+    filename = reports_dir / f"adbreport-{android_safe_serial(serial)}-{ts}.md"
+
+    with open(filename, "w", encoding="utf-8") as fh:
+
+        fh.write("# ADB Device Report\n")
+
+        fh.write(f"- **Device**: `{serial}`\n")
+
+        fh.write(f"- **Model**: {info.get('model', '-') }\n")
+
+        fh.write(f"- **Product**: {info.get('product', '-') }\n")
+
+        fh.write(f"- **Android**: {info.get('android_version', '?')} (SDK {info.get('sdk_text', '?')})\n")
+
+        fh.write(f"- **Generated**: {datetime.now(tz=TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}\n\n")
+
+        fh.write("## Summary\n")
+
+        fh.write(f"- Uptime: {info.get('uptime', '?')}\n")
+
+        fh.write(f"- {info.get('battery_text', 'Battery: ?')}\n")
+
+        fh.write(f"- {info.get('airplane_text', 'Airplane Mode: unknown')}\n")
+
+        fh.write(f"- {info.get('mobile_data_text', 'Mobile Data: unknown')}\n")
+
+        network_line = (info.get('network_text', 'Network: ?') or '').replace('\n', ' | ')
+        fh.write(f"- {network_line}\n\n")
+
+        fh.write("## Memory\n")
+
+        fh.write(f"{info.get('memory_text', '?')}\n\n")
+
+        fh.write("## Storage\n")
+
+        for ln in info.get("storage_lines", []):
+
+            fh.write(f"    {ln}\n")
+
+        if not info.get("storage_lines"):
+
+            fh.write("    (tidak tersedia)\n")
+
+        fh.write("\n## Top Processes\n")
+
+        for ln in info.get("process_lines", []):
+
+            fh.write(f"    {ln}\n")
+
+        if not info.get("process_lines"):
+
+            fh.write("    (tidak tersedia)\n")
+
+        fh.write("\n## Last 5 SMS (Inbox)\n")
+
+        if sms_text.strip():
+
+            for ln in sms_text.splitlines():
+
+                fh.write(f"    {ln}\n")
+
+        else:
+
+            fh.write("    (Tidak ada SMS)\n")
+
+    return filename
+
+
+def android_menu_message(devices: List[AndroidDevice], selected: Optional[str], label: Optional[str]) -> str:
+
+    lines: List[str] = ["🤖 *Android Device Center*"]
+
+    if not devices:
+
+        lines.append("Tidak ada device ADB yang terdeteksi. Pastikan perangkat terhubung dan USB debugging aktif.")
+
+        return "\n".join(lines)
+
+    if selected:
+
+        display_label = label
+
+        if not display_label:
+
+            for dev in devices:
+
+                if dev.serial == selected:
+
+                    display_label = android_device_label(dev)
+
+                    break
+
+        if display_label:
+
+            lines.append(f"Device aktif: `{mdv2_escape(selected)}` — {mdv2_escape(display_label)}")
+
+        else:
+
+            lines.append(f"Device aktif: `{mdv2_escape(selected)}`")
+
+    else:
+
+        lines.append("Pilih device yang ingin digunakan dengan tombol di bawah.")
+
+    lines.append("")
+
+    lines.append("*Daftar device:*")
+
+    for dev in devices:
+
+        status_icon = "✅" if dev.status == "device" else "⚠️" if dev.status in {"unauthorized", "offline"} else "ℹ️"
+
+        desc = android_device_label(dev)
+
+        lines.append(f"{status_icon} `{mdv2_escape(dev.serial)}` — {mdv2_escape(desc)}")
+
+    return "\n".join(lines)
+
+
+async def android_signal_monitor_task(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, serial: str,
+
+                                    samples: int = 10, interval: float = 2.0) -> None:
+
+    for _ in range(max(1, samples)):
+
+        info = android_signal_strength_text(serial)
+
+        now = datetime.now(tz=TZ).strftime("%H:%M:%S")
+
+        try:
+
+            await ctx.bot.send_message(chat_id=chat_id, text=f"{now}  {info}")
+
+        except Exception:
+
+            break
+
+        await asyncio.sleep(interval)
+
+    try:
+
+        await ctx.bot.send_message(chat_id=chat_id, text="✅ Monitor sinyal selesai.")
+
+    except Exception:
+
+        pass
 
 
 # ------------------ DB (Speedtest + Settings + Alerts) -----
@@ -2177,10 +3495,89 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📁 File Manager", callback_data="MENU_FILEMAN")],
         [InlineKeyboardButton("⚡ Speedtest", callback_data="MENU_SPEEDTEST")],
         [InlineKeyboardButton("🛠️ Tools", callback_data="MENU_TOOLS_ROOT")],
+        [InlineKeyboardButton("🤖 Android", callback_data="MENU_ANDROID")],
         [InlineKeyboardButton("🔔 Alerts", callback_data="MENU_ALERTS")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="MENU_SETTINGS")],
         [InlineKeyboardButton("💾 Backup/Restore", callback_data="MENU_BACKUP")],
     ])
+
+
+def android_menu_keyboard(has_device: bool) -> InlineKeyboardMarkup:
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    if has_device:
+
+        rows.append([
+
+            InlineKeyboardButton("ℹ️ Ringkasan", callback_data="ANDROID_SUMMARY"),
+
+            InlineKeyboardButton("📨 SMS Terakhir", callback_data="ANDROID_SMS"),
+
+        ])
+
+        rows.append([
+
+            InlineKeyboardButton("✈️ Toggle Airplane", callback_data="ANDROID_TOGGLE_AIRPLANE"),
+
+            InlineKeyboardButton("📶 Toggle Data", callback_data="ANDROID_TOGGLE_MOBILE"),
+
+        ])
+
+        rows.append([
+
+            InlineKeyboardButton("📡 Monitor Sinyal", callback_data="ANDROID_SIGNAL_MONITOR"),
+
+            InlineKeyboardButton("📝 Export Report", callback_data="ANDROID_EXPORT"),
+
+        ])
+
+        rows.append([
+
+            InlineKeyboardButton("🔄 Ganti Device", callback_data="ANDROID_CHOOSE"),
+
+        ])
+
+    else:
+
+        rows.append([
+
+            InlineKeyboardButton("🔄 Cari Device", callback_data="ANDROID_REFRESH"),
+
+        ])
+
+    rows.append([InlineKeyboardButton("📱 Menu Utama", callback_data="SHOW_MAIN_MENU")])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def android_device_select_keyboard(devices: List[AndroidDevice]) -> InlineKeyboardMarkup:
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    ready_devices = [dev for dev in devices if dev.status == "device"]
+
+    for dev in ready_devices:
+
+        label = android_choice_label(dev)
+
+        callback = f"ANDROID_SET:{dev.serial}"
+
+        if len(callback) > 64:
+
+            callback = callback[:64]
+
+        rows.append([InlineKeyboardButton(label, callback_data=callback)])
+
+    if not rows:
+
+        rows.append([InlineKeyboardButton("❌ Tidak ada device siap", callback_data="ANDROID_REFRESH")])
+
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="ANDROID_REFRESH")])
+
+    rows.append([InlineKeyboardButton("📱 Menu Android", callback_data="MENU_ANDROID")])
+
+    return InlineKeyboardMarkup(rows)
 
 
 def vnstat_menu() -> InlineKeyboardMarkup:
@@ -3395,6 +4792,140 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "SHOW_MAIN_MENU":
         reset_user_state(ctx.user_data)
         await query.edit_message_text("📱 *Main Menu*", parse_mode="Markdown", reply_markup=main_menu()); return
+
+    if data in {"MENU_ANDROID", "ANDROID_REFRESH"}:
+        if not android_adb_available():
+            text = "❌ *Android tools tidak tersedia.*\nadb tidak ditemukan di PATH."
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                          reply_markup=android_menu_keyboard(False))
+            return
+        devices = android_list_devices()
+        selected, label = android_ensure_selection(ctx, devices)
+        text = android_menu_message(devices, selected, label)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                      reply_markup=android_menu_keyboard(bool(selected)))
+        return
+
+    if data == "ANDROID_CHOOSE":
+        if not android_adb_available():
+            await query.message.reply_text("❌ adb tidak ditemukan di PATH.")
+            return
+        devices = android_list_devices()
+        selected, label = android_resolve_selection(ctx, devices)
+        text = android_menu_message(devices, selected, label)
+        text += "\n\n" + mdv2_escape("Pilih device siap status ✅ di bawah.")
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                      reply_markup=android_device_select_keyboard(devices))
+        return
+
+    if data.startswith("ANDROID_SET:"):
+        serial = data.split(":", 1)[1]
+        devices = android_list_devices()
+        dev = next((d for d in devices if d.serial == serial), None)
+        if not dev:
+            await query.message.reply_text("❌ Device tidak ditemukan. Coba refresh dari Menu Android.")
+            return
+        if dev.status != "device":
+            await query.message.reply_text(
+                f"❌ Device `{mdv2_escape(serial)}` belum siap (status {mdv2_escape(dev.status)}).",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        label = android_device_label(dev)
+        android_set_selected_device(ctx, dev.serial, label)
+        text = android_menu_message(devices, dev.serial, label)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                      reply_markup=android_menu_keyboard(True))
+        return
+
+    if data == "ANDROID_SUMMARY":
+        device = android_selected_device(ctx)
+        if not device:
+            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
+            return
+        if not android_device_ready(device):
+            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
+            return
+        info = android_collect_info(device)
+        label = android_selected_label(ctx)
+        summary = android_summary_text(info, label)
+        await query.message.reply_text(code_block(summary), parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    if data == "ANDROID_SMS":
+        device = android_selected_device(ctx)
+        if not device:
+            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
+            return
+        if not android_device_ready(device):
+            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
+            return
+        info = android_collect_info(device)
+        sms_text, error = android_sms_text(device, info.get("sdk_int"))
+        await query.message.reply_text(code_block(sms_text), parse_mode=ParseMode.MARKDOWN_V2)
+        if error:
+            await query.message.reply_text(f"⚠️ {error}")
+        return
+
+    if data == "ANDROID_TOGGLE_AIRPLANE":
+        device = android_selected_device(ctx)
+        if not device:
+            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
+            return
+        if not android_device_ready(device):
+            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
+            return
+        result = android_toggle_airplane(device)
+        await query.message.reply_text(result)
+        return
+
+    if data == "ANDROID_TOGGLE_MOBILE":
+        device = android_selected_device(ctx)
+        if not device:
+            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
+            return
+        if not android_device_ready(device):
+            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
+            return
+        result = android_toggle_mobile_data(device)
+        await query.message.reply_text(result)
+        return
+
+    if data == "ANDROID_SIGNAL_MONITOR":
+        device = android_selected_device(ctx)
+        if not device:
+            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
+            return
+        if not android_device_ready(device):
+            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
+            return
+        if update.effective_chat is None or ctx.application is None:
+            await query.message.reply_text("❌ Monitor tidak tersedia pada konteks ini.")
+            return
+        await query.message.reply_text("▶️ Monitor sinyal dimulai (10 sampel).")
+        ctx.application.create_task(android_signal_monitor_task(ctx, update.effective_chat.id, device))
+        return
+
+    if data == "ANDROID_EXPORT":
+        device = android_selected_device(ctx)
+        if not device:
+            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
+            return
+        if not android_device_ready(device):
+            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
+            return
+        info = android_collect_info(device)
+        sms_text, error = android_sms_text(device, info.get("sdk_int"))
+        try:
+            path = android_export_report(device, info, sms_text)
+            caption = "✅ Report Android berhasil dibuat."
+            if error:
+                caption += f"\n⚠️ {error}"
+            with open(path, "rb") as fh:
+                await query.message.reply_document(fh, filename=os.path.basename(path), caption=caption)
+        except Exception as exc:
+            await query.message.reply_text(f"❌ Gagal mengirim report: {exc}")
+        return
 
     if data == "QA_WIFI_RESTART":
         out = run_wifi_reload()
