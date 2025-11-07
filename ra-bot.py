@@ -3527,14 +3527,6 @@ def android_menu_keyboard(has_device: bool) -> InlineKeyboardMarkup:
 
         rows.append([
 
-            InlineKeyboardButton("📨 10 SMS Terakhir", callback_data="ANDROID_SMS_10"),
-
-            InlineKeyboardButton("✈️ Refresh IP (Airplane)", callback_data="ANDROID_TOGGLE_AIRPLANE"),
-
-        ])
-
-        rows.append([
-
             InlineKeyboardButton("📡 Monitor Sinyal", callback_data="ANDROID_SIGNAL_MONITOR"),
 
             InlineKeyboardButton("📝 Export Report", callback_data="ANDROID_EXPORT"),
@@ -4861,7 +4853,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(code_block(summary), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    if data in {"ANDROID_SMS_5", "ANDROID_SMS_10"}:
+    if data == "ANDROID_SMS_5":
         device = android_selected_device(ctx)
         if not device:
             await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
@@ -4870,25 +4862,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
             return
         info = android_collect_info(device)
-        limit = 5 if data.endswith("5") else 10
+        limit = 5
         sms_text, error = android_sms_text(device, info.get("sdk_int"), limit=limit)
-        header = f"{limit} SMS Terakhir (Inbox)"
+        header = "5 SMS Terakhir (Inbox)"
         payload = f"{header}\n\n{sms_text}".strip()
         await query.message.reply_text(code_block(payload), parse_mode=ParseMode.MARKDOWN_V2)
         if error:
             await query.message.reply_text(f"⚠️ {error}")
-        return
-
-    if data == "ANDROID_TOGGLE_AIRPLANE":
-        device = android_selected_device(ctx)
-        if not device:
-            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
-            return
-        if not android_device_ready(device):
-            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
-            return
-        result = android_toggle_airplane(device)
-        await query.message.reply_text(result)
         return
 
 
