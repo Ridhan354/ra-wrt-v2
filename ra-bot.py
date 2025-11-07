@@ -1254,7 +1254,7 @@ def android_summary_text(info: Dict[str, Any], label: Optional[str] = None) -> s
     return "\n".join(lines)
 
 
-def android_parse_content_sms(output: str) -> List[AndroidSMS]:
+def android_parse_content_sms(output: str, limit: Optional[int] = None) -> List[AndroidSMS]:
 
     entries: List[AndroidSMS] = []
 
@@ -1306,10 +1306,14 @@ def android_parse_content_sms(output: str) -> List[AndroidSMS]:
 
     entries.sort(key=lambda sms: sms.ts_ms or 0, reverse=True)
 
-    return entries[:5]
+    if limit is not None and limit > 0:
+
+        return entries[:limit]
+
+    return entries
 
 
-def android_parse_sqlite_sms(output: str) -> List[AndroidSMS]:
+def android_parse_sqlite_sms(output: str, limit: Optional[int] = None) -> List[AndroidSMS]:
 
     entries: List[AndroidSMS] = []
 
@@ -1347,7 +1351,11 @@ def android_parse_sqlite_sms(output: str) -> List[AndroidSMS]:
 
     entries.sort(key=lambda sms: sms.ts_ms or 0, reverse=True)
 
-    return entries[:5]
+    if limit is not None and limit > 0:
+
+        return entries[:limit]
+
+    return entries
 
 
 def android_content_query(serial: str, sort: bool = True) -> str:
@@ -1379,16 +1387,20 @@ def android_device_has_sqlite(serial: str) -> bool:
     return bool(res) and not res.startswith("[ERR]")
 
 
-def android_sqlite_query_device(serial: str, path: str) -> List[AndroidSMS]:
+def android_sqlite_query_device(serial: str, path: str, limit: int) -> List[AndroidSMS]:
 
-    cmd = f"sqlite3 '{path}' \"SELECT address, body, date FROM sms WHERE type=1 ORDER BY date DESC LIMIT 5;\""
+    limit = max(1, int(limit))
+
+    cmd = (
+        f"sqlite3 '{path}' \"SELECT address, body, date FROM sms WHERE type=1 ORDER BY date DESC LIMIT {limit};\""
+    )
 
     out = android_shell_root(serial, cmd)
 
-    return android_parse_sqlite_sms(out)
+    return android_parse_sqlite_sms(out, limit=limit)
 
 
-def android_sqlite_read_local(path: Path) -> List[AndroidSMS]:
+def android_sqlite_read_local(path: Path, limit: int) -> List[AndroidSMS]:
 
     entries: List[AndroidSMS] = []
 
@@ -1402,7 +1414,9 @@ def android_sqlite_read_local(path: Path) -> List[AndroidSMS]:
 
         rows = cur.execute(
 
-            "SELECT address, body, date FROM sms WHERE type=1 ORDER BY date DESC LIMIT 5;"
+            "SELECT address, body, date FROM sms WHERE type=1 ORDER BY date DESC LIMIT ?;",
+
+            (max(1, int(limit)),),
 
         ).fetchall()
 
@@ -1450,10 +1464,14 @@ def android_sqlite_read_local(path: Path) -> List[AndroidSMS]:
 
     entries.sort(key=lambda sms: sms.ts_ms or 0, reverse=True)
 
-    return entries[:5]
+    if limit and limit > 0:
+
+        return entries[:limit]
+
+    return entries
 
 
-def android_sqlite_pull_and_query(serial: str) -> List[AndroidSMS]:
+def android_sqlite_pull_and_query(serial: str, limit: int) -> List[AndroidSMS]:
 
     remote_tmp = "/sdcard/mmssms.db"
 
@@ -1485,7 +1503,7 @@ def android_sqlite_pull_and_query(serial: str) -> List[AndroidSMS]:
 
                 continue
 
-            entries = android_sqlite_read_local(local_path)
+            entries = android_sqlite_read_local(local_path, limit)
 
             if entries:
 
@@ -1500,11 +1518,17 @@ def android_sqlite_pull_and_query(serial: str) -> List[AndroidSMS]:
     return []
 
 
-def android_fetch_sms_entries(serial: str, sdk_int: Optional[int]) -> Tuple[List[AndroidSMS], Optional[str]]:
+def android_fetch_sms_entries(
+    serial: str,
+    sdk_int: Optional[int],
+    limit: int = 5,
+) -> Tuple[List[AndroidSMS], Optional[str]]:
+
+    limit = max(1, int(limit))
 
     out = android_content_query(serial, sort=True)
 
-    entries = android_parse_content_sms(out)
+    entries = android_parse_content_sms(out, limit=limit)
 
     if entries:
 
@@ -1512,7 +1536,7 @@ def android_fetch_sms_entries(serial: str, sdk_int: Optional[int]) -> Tuple[List
 
     out = android_content_query(serial, sort=False)
 
-    entries = android_parse_content_sms(out)
+    entries = android_parse_content_sms(out, limit=limit)
 
     if entries:
 
@@ -1524,7 +1548,7 @@ def android_fetch_sms_entries(serial: str, sdk_int: Optional[int]) -> Tuple[List
 
         out = android_content_query_root(serial, sort=True)
 
-        entries = android_parse_content_sms(out)
+        entries = android_parse_content_sms(out, limit=limit)
 
         if entries:
 
@@ -1536,7 +1560,7 @@ def android_fetch_sms_entries(serial: str, sdk_int: Optional[int]) -> Tuple[List
 
             out = android_content_query_root(serial, sort=False)
 
-            entries = android_parse_content_sms(out)
+            entries = android_parse_content_sms(out, limit=limit)
 
             if entries:
 
@@ -1550,7 +1574,7 @@ def android_fetch_sms_entries(serial: str, sdk_int: Optional[int]) -> Tuple[List
 
     out = android_content_query_root(serial, sort=False)
 
-    entries = android_parse_content_sms(out)
+    entries = android_parse_content_sms(out, limit=limit)
 
     if entries:
 
@@ -1560,13 +1584,13 @@ def android_fetch_sms_entries(serial: str, sdk_int: Optional[int]) -> Tuple[List
 
         for path in ANDROID_SMS_DB_PATHS:
 
-            entries = android_sqlite_query_device(serial, path)
+            entries = android_sqlite_query_device(serial, path, limit)
 
             if entries:
 
                 return entries, None
 
-    entries = android_sqlite_pull_and_query(serial)
+    entries = android_sqlite_pull_and_query(serial, limit)
 
     if entries:
 
@@ -1616,10 +1640,12 @@ def android_format_sms(entries: List[AndroidSMS]) -> str:
 
 def android_sms_text(serial: str, sdk_int: Optional[int], limit: int = 5) -> Tuple[str, Optional[str]]:
 
-    entries, error = android_fetch_sms_entries(serial, sdk_int)
+    safe_limit = max(1, int(limit))
+
+    entries, error = android_fetch_sms_entries(serial, sdk_int, limit=safe_limit)
 
     if entries:
-        entries = entries[: max(1, limit)]
+        entries = entries[:safe_limit]
 
     return android_format_sms(entries), error
 
@@ -3501,14 +3527,6 @@ def android_menu_keyboard(has_device: bool) -> InlineKeyboardMarkup:
 
         rows.append([
 
-            InlineKeyboardButton("📨 10 SMS Terakhir", callback_data="ANDROID_SMS_10"),
-
-            InlineKeyboardButton("✈️ Refresh IP (Airplane)", callback_data="ANDROID_TOGGLE_AIRPLANE"),
-
-        ])
-
-        rows.append([
-
             InlineKeyboardButton("📡 Monitor Sinyal", callback_data="ANDROID_SIGNAL_MONITOR"),
 
             InlineKeyboardButton("📝 Export Report", callback_data="ANDROID_EXPORT"),
@@ -4835,7 +4853,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(code_block(summary), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    if data in {"ANDROID_SMS_5", "ANDROID_SMS_10"}:
+    if data == "ANDROID_SMS_5":
         device = android_selected_device(ctx)
         if not device:
             await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
@@ -4844,25 +4862,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
             return
         info = android_collect_info(device)
-        limit = 5 if data.endswith("5") else 10
+        limit = 5
         sms_text, error = android_sms_text(device, info.get("sdk_int"), limit=limit)
-        header = f"{limit} SMS Terakhir (Inbox)"
+        header = "5 SMS Terakhir (Inbox)"
         payload = f"{header}\n\n{sms_text}".strip()
         await query.message.reply_text(code_block(payload), parse_mode=ParseMode.MARKDOWN_V2)
         if error:
             await query.message.reply_text(f"⚠️ {error}")
-        return
-
-    if data == "ANDROID_TOGGLE_AIRPLANE":
-        device = android_selected_device(ctx)
-        if not device:
-            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
-            return
-        if not android_device_ready(device):
-            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
-            return
-        result = android_toggle_airplane(device)
-        await query.message.reply_text(result)
         return
 
 
