@@ -2832,7 +2832,7 @@ def build_overview_text(iface: str) -> str:
 
     lines = [
 
-        "👋 *Selamat datang di RANET Bot*",
+        "👋 *Selamat datang di RANET Bot-V2*",
 
         f"🕒 *Waktu server:* `{ts}`",
 
