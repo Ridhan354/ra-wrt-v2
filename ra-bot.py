@@ -1614,129 +1614,112 @@ def android_format_sms(entries: List[AndroidSMS]) -> str:
     return "\n".join(lines).strip()
 
 
-def android_sms_text(serial: str, sdk_int: Optional[int]) -> Tuple[str, Optional[str]]:
+def android_sms_text(serial: str, sdk_int: Optional[int], limit: int = 5) -> Tuple[str, Optional[str]]:
 
     entries, error = android_fetch_sms_entries(serial, sdk_int)
+
+    if entries:
+        entries = entries[: max(1, limit)]
 
     return android_format_sms(entries), error
 
 
-def android_toggle_airplane(serial: str) -> str:
+def android_toggle_airplane(serial: str, pause_seconds: float = 3.0) -> str:
 
-    mode, enabled, _ = android_airplane_status(serial)
+    mode, _, _ = android_airplane_status(serial)
 
     if mode == "unknown":
 
         return "❌ Tidak bisa membaca status Airplane Mode."
 
+    wait_time = max(0.0, float(pause_seconds))
+
+    def _pause() -> None:
+
+        if wait_time > 0:
+
+            time.sleep(wait_time)
+
     if mode == "new":
 
-        target = "disable" if enabled else "enable"
-
-        res = android_shell(serial, "cmd", "connectivity", "airplane-mode", target)
+        res = android_shell(serial, "cmd", "connectivity", "airplane-mode", "enable")
 
         if res and res.startswith("[ERR]"):
 
-            return f"❌ Gagal mengubah Airplane Mode: {res}"
+            return f"❌ Gagal mengaktifkan Airplane Mode: {res}"
+
+        _pause()
+
+        res = android_shell(serial, "cmd", "connectivity", "airplane-mode", "disable")
+
+        if res and res.startswith("[ERR]"):
+
+            return f"❌ Gagal mematikan Airplane Mode: {res}"
 
         _, final_state, _ = android_airplane_status(serial)
 
-        if final_state is True:
+        if final_state:
 
-            return "✈️ Airplane Mode diaktifkan."
+            return "⚠️ Airplane Mode tetap aktif setelah refresh. Nonaktifkan manual."
 
-        if final_state is False:
-
-            return "✈️ Airplane Mode dimatikan."
-
-        return "✈️ Airplane Mode ditoggle."
+        return "✈️ Airplane Mode dinyalakan sementara untuk refresh IP dan sudah dimatikan lagi."
 
     if android_has_root(serial):
 
-        if enabled:
+        enable_cmd = (
 
-            cmd = (
+            "settings put global airplane_mode_on 1; "
 
-                "settings put global airplane_mode_on 0; "
+            "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true"
 
-                "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false"
+        )
 
-            )
+        disable_cmd = (
 
-        else:
+            "settings put global airplane_mode_on 0; "
 
-            cmd = (
+            "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false"
 
-                "settings put global airplane_mode_on 1; "
+        )
 
-                "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true"
-
-            )
-
-        res = android_shell_root(serial, cmd)
+        res = android_shell_root(serial, enable_cmd)
 
         if res and res.startswith("[ERR]"):
 
-            return f"❌ Gagal mengubah Airplane Mode: {res}"
+            return f"❌ Gagal mengaktifkan Airplane Mode: {res}"
+
+        _pause()
+
+        res = android_shell_root(serial, disable_cmd)
+
+        if res and res.startswith("[ERR]"):
+
+            return f"❌ Gagal mematikan Airplane Mode: {res}"
 
         _, final_state, _ = android_airplane_status(serial)
 
-        if final_state is True:
+        if final_state:
 
-            return "✈️ Airplane Mode diaktifkan (legacy)."
+            return "⚠️ Airplane Mode tetap aktif setelah refresh. Nonaktifkan manual."
 
-        if final_state is False:
+        return "✈️ Airplane Mode dinyalakan sementara (legacy) dan sudah dimatikan lagi."
 
-            return "✈️ Airplane Mode dimatikan (legacy)."
-
-        return "✈️ Airplane Mode ditoggle (legacy)."
-
-    target = "0" if enabled else "1"
-
-    res = android_shell(serial, "settings", "put", "global", "airplane_mode_on", target)
+    res = android_shell(serial, "settings", "put", "global", "airplane_mode_on", "1")
 
     if res and res.startswith("[ERR]"):
 
-        return f"❌ Gagal mengubah Airplane Mode: {res}"
+        return f"❌ Gagal mengaktifkan Airplane Mode: {res}"
 
-    return "⚠️ Airplane Mode ditoggle tanpa root (mungkin tidak persist)."
+    _pause()
 
-
-def android_toggle_mobile_data(serial: str) -> str:
-
-    current, _ = android_mobile_data_status(serial)
-
-    disable = current is True
-
-    action = "disable" if disable else "enable"
-
-    res = android_shell(serial, "svc", "data", action)
-
-    if res and (res.startswith("[ERR]") or "Permission" in res or "ecurity" in res):
-
-        if android_has_root(serial):
-
-            res = android_shell_root(serial, f"svc data {action}")
-
-        else:
-
-            return f"❌ Gagal mengubah mobile data: {res or 'akses ditolak'}"
+    res = android_shell(serial, "settings", "put", "global", "airplane_mode_on", "0")
 
     if res and res.startswith("[ERR]"):
 
-        return f"❌ Gagal mengubah mobile data: {res}"
+        return f"❌ Gagal mematikan Airplane Mode: {res}"
 
-    final, _ = android_mobile_data_status(serial)
+    return "⚠️ Airplane Mode direfresh tanpa root (mungkin tidak persist)."
 
-    if final is True:
-
-        return "📶 Mobile data diaktifkan."
-
-    if final is False:
-
-        return "📶 Mobile data dimatikan."
-
-    return "📶 Mobile data ditoggle, status akhir tidak diketahui."
 
 
 def android_safe_serial(serial: str) -> str:
@@ -3512,15 +3495,15 @@ def android_menu_keyboard(has_device: bool) -> InlineKeyboardMarkup:
 
             InlineKeyboardButton("ℹ️ Ringkasan", callback_data="ANDROID_SUMMARY"),
 
-            InlineKeyboardButton("📨 SMS Terakhir", callback_data="ANDROID_SMS"),
+            InlineKeyboardButton("📨 5 SMS Terakhir", callback_data="ANDROID_SMS_5"),
 
         ])
 
         rows.append([
 
-            InlineKeyboardButton("✈️ Toggle Airplane", callback_data="ANDROID_TOGGLE_AIRPLANE"),
+            InlineKeyboardButton("📨 10 SMS Terakhir", callback_data="ANDROID_SMS_10"),
 
-            InlineKeyboardButton("📶 Toggle Data", callback_data="ANDROID_TOGGLE_MOBILE"),
+            InlineKeyboardButton("✈️ Refresh IP (Airplane)", callback_data="ANDROID_TOGGLE_AIRPLANE"),
 
         ])
 
@@ -4852,7 +4835,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(code_block(summary), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    if data == "ANDROID_SMS":
+    if data in {"ANDROID_SMS_5", "ANDROID_SMS_10"}:
         device = android_selected_device(ctx)
         if not device:
             await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
@@ -4861,8 +4844,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
             return
         info = android_collect_info(device)
-        sms_text, error = android_sms_text(device, info.get("sdk_int"))
-        await query.message.reply_text(code_block(sms_text), parse_mode=ParseMode.MARKDOWN_V2)
+        limit = 5 if data.endswith("5") else 10
+        sms_text, error = android_sms_text(device, info.get("sdk_int"), limit=limit)
+        header = f"{limit} SMS Terakhir (Inbox)"
+        payload = f"{header}\n\n{sms_text}".strip()
+        await query.message.reply_text(code_block(payload), parse_mode=ParseMode.MARKDOWN_V2)
         if error:
             await query.message.reply_text(f"⚠️ {error}")
         return
@@ -4879,17 +4865,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(result)
         return
 
-    if data == "ANDROID_TOGGLE_MOBILE":
-        device = android_selected_device(ctx)
-        if not device:
-            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
-            return
-        if not android_device_ready(device):
-            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
-            return
-        result = android_toggle_mobile_data(device)
-        await query.message.reply_text(result)
-        return
 
     if data == "ANDROID_SIGNAL_MONITOR":
         device = android_selected_device(ctx)
