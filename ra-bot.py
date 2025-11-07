@@ -788,17 +788,17 @@ def autodetect_iface() -> str:
 
     m = re.search(r"interfaces:\s*(.+)$", out, re.IGNORECASE | re.MULTILINE)
 
-    if not m: return "eth0"
+    if not m: return "br-lan"
 
     names = m.group(1).strip().split()
 
-    if "eth0" in names: return "eth0"
+    if "br-lan" in names: return "br-lan"
 
     for n in names:
 
         if n.startswith(("en", "eth", "ens", "eno", "wan", "br-")): return n
 
-    return names[0] if names else "eth0"
+    return names[0] if names else "br-lan"
 
 
 
@@ -808,7 +808,7 @@ def list_ifaces() -> List[str]:
 
     m = re.search(r"interfaces:\s*(.+)$", out, re.IGNORECASE | re.MULTILINE)
 
-    return (m.group(1).strip().split() if m else ["eth0"]) or ["eth0"]
+    return (m.group(1).strip().split() if m else ["br-lan"]) or ["br-lan"]
 
 
 
