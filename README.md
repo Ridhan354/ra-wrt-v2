@@ -6,7 +6,7 @@
    ```sh
    curl -fsSLO https://raw.githubusercontent.com/Ridhan354/ra-wrt-v2/main/ranet-manager.sh
    chmod +x ranet-manager.sh
-   ./setup-rabot.sh
+   ./ranet-manager.sh
    ```
 
 3. Ikuti prompt untuk memasukkan BOT TOKEN dan Chat ID admin. Jika variabel lingkungan `BOT_TOKEN` dan `CHAT_ID` sudah diisi, skrip melewati pertanyaan tersebut.
