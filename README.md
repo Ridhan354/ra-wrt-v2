@@ -4,7 +4,7 @@
 2. Unduh dan jalankan skrip installer (seluruh dependensi, bot Telegram, dan utilitas USB watchdog akan diunduh otomatis):
 
    ```sh
-   curl -fsSLO https://raw.githubusercontent.com/Ridhan354/ra-wrt-v2/blob/main/ranet-manager.sh
+   curl -fsSLO https://raw.githubusercontent.com/Ridhan354/ra-wrt-v2/main/ranet-manager.sh
    chmod +x ranet-manager.sh
    ./setup-rabot.sh
    ```
