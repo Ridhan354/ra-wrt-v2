@@ -2042,12 +2042,10 @@ async def android_monitor_loop(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, ser
             ok, detail = android_monitor_single(serial, cfg)
             now = datetime.now(tz=TZ).strftime("%H:%M:%S")
             retry_text = ""
+            entry = f"{now} — {detail}"
             if not ok:
                 retry_text = f" Retry {failures + 1}/{max_fail}"
-            await android_monitor_send(ctx, chat_id, f"{now} — {detail}{retry_text}")
-            if ok:
-                failures = 0
-            else:
+                await android_monitor_send(ctx, chat_id, f"{entry}{retry_text}")
                 failures += 1
                 if failures >= max_fail:
                     warn = (
@@ -2056,6 +2054,13 @@ async def android_monitor_loop(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, ser
                     )
                     await android_monitor_send(ctx, chat_id, warn)
                     break
+            else:
+                if failures > 0:
+                    recovery = f"{entry} (pulih setelah {failures} kegagalan)"
+                    await android_monitor_send(ctx, chat_id, recovery)
+                else:
+                    android_monitor_record(chat_id, entry)
+                failures = 0
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         await android_monitor_send(ctx, chat_id, "⏹️ Monitoring dibatalkan.")
