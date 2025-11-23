@@ -5169,11 +5169,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sample = (
             "method=https host=chat.whatsapp.com interval=5 max_failures=3 airplane_delay=5"
         )
-        msg = (
-            "✏️ Kirim konfigurasi monitoring (key=value dipisah spasi).\n"
-            "Key: method(http/https/ping/device-ping), host, interval, max_failures, airplane_delay.\n"
-            f"Contoh: `{sample}`"
-        )
+        prompt_lines = [
+            mdv2_escape("✏️ Kirim konfigurasi monitoring (key=value dipisah spasi)."),
+            mdv2_escape(
+                "Key: method(http/https/ping/device-ping), host, interval, max_failures, airplane_delay."
+            ),
+            mdv2_escape("Contoh:"),
+            code_block(sample),
+        ]
+        msg = "\n".join(prompt_lines)
         await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
         cfg = android_monitor_load_config()
         text = android_monitor_status_text(cfg, running)
