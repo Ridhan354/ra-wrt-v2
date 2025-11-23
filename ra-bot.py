@@ -24,7 +24,7 @@ import os, re, shlex, subprocess, glob, sqlite3, time, math, urllib.request, url
 import sys, asyncio, tempfile, json, stat, contextlib
 from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 import shutil, errno  # — PATCH: untuk copy fallback EXDEV
 from dataclasses import dataclass, field
@@ -1918,6 +1918,8 @@ ANDROID_MONITOR_DEFAULT = {
 }
 
 ANDROID_MONITOR_TASKS: Dict[int, asyncio.Task] = {}
+ANDROID_MONITOR_LOGS: Dict[int, deque] = defaultdict(lambda: deque(maxlen=50))
+ANDROID_MONITOR_PENDING: Dict[int, List[str]] = defaultdict(list)
 
 
 def android_monitor_load_config() -> Dict[str, Any]:
@@ -1938,6 +1940,38 @@ def android_monitor_save_config(cfg: Dict[str, Any]) -> None:
     settings_set("android_mon_airdelay", str(cfg.get("airplane_delay", "")))
 
 
+def android_monitor_record(chat_id: int, entry: str) -> None:
+    ANDROID_MONITOR_LOGS[chat_id].append(entry)
+
+
+async def android_monitor_flush(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    pending = list(ANDROID_MONITOR_PENDING.get(chat_id) or [])
+    if not pending:
+        return
+    delivered = 0
+    for msg in pending:
+        try:
+            await ctx.bot.send_message(chat_id=chat_id, text=msg)
+            delivered += 1
+        except NetworkError:
+            break
+        except Exception:
+            break
+    if delivered:
+        ANDROID_MONITOR_PENDING[chat_id] = pending[delivered:]
+
+
+async def android_monitor_send(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    android_monitor_record(chat_id, text)
+    try:
+        await android_monitor_flush(ctx, chat_id)
+        await ctx.bot.send_message(chat_id=chat_id, text=text)
+    except NetworkError:
+        ANDROID_MONITOR_PENDING[chat_id].append(text)
+    except Exception:
+        ANDROID_MONITOR_PENDING[chat_id].append(text)
+
+
 def android_monitor_running(chat_id: int) -> bool:
     task = ANDROID_MONITOR_TASKS.get(chat_id)
     return bool(task) and not task.done()
@@ -1945,14 +1979,15 @@ def android_monitor_running(chat_id: int) -> bool:
 
 def android_monitor_status_text(cfg: Dict[str, Any], running: bool) -> str:
     method_map = {
-        "https": "HTTPS (secure HTTP ping)",
-        "http": "HTTP (standard)",
-        "ping": "ICMP ping (host)",
+        "https": "HTTPS \(secure HTTP ping\)",
+        "http": "HTTP \(standard\)",
+        "ping": "ICMP ping \(host\)",
         "device-ping": "ICMP ping via Android",
     }
     lines = ["📡 *Android Monitoring*"]
     lines.append(f"Status: {'🟢 Aktif' if running else '⚪️ Tidak aktif'}")
-    lines.append(f"Metode: {method_map.get(cfg.get('method'), cfg.get('method'))}")
+    method_label = method_map.get(cfg.get("method"), cfg.get("method"))
+    lines.append(f"Metode: {method_label}")
     lines.append(f"Host/URL: `{mdv2_escape(cfg.get('host', '-'))}`")
     lines.append(f"Interval: {cfg.get('interval', '?')} detik")
     lines.append(f"Max kegagalan: {cfg.get('max_failures', '?')} kali")
@@ -1996,18 +2031,15 @@ async def android_monitor_loop(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, ser
     max_fail = max(1, int(cfg.get("max_failures", 3)))
     failures = 0
     start_ts = datetime.now(tz=TZ).strftime("%H:%M:%S")
-    try:
-        await ctx.bot.send_message(chat_id=chat_id, text=f"▶️ Monitoring dimulai ({start_ts}).")
-    except Exception:
-        return
+    await android_monitor_send(ctx, chat_id, f"▶️ Monitoring dimulai ({start_ts}).")
     try:
         while True:
             ok, detail = android_monitor_single(serial, cfg)
             now = datetime.now(tz=TZ).strftime("%H:%M:%S")
-            try:
-                await ctx.bot.send_message(chat_id=chat_id, text=f"{now} — {detail}")
-            except Exception:
-                pass
+            retry_text = ""
+            if not ok:
+                retry_text = f" Retry {failures + 1}/{max_fail}"
+            await android_monitor_send(ctx, chat_id, f"{now} — {detail}{retry_text}")
             if ok:
                 failures = 0
             else:
@@ -2017,17 +2049,11 @@ async def android_monitor_loop(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, ser
                         f"❌ Monitoring dihentikan. Batas gagal {max_fail} tercapai. "
                         f"(Delay airplane: {cfg.get('airplane_delay')}s)"
                     )
-                    try:
-                        await ctx.bot.send_message(chat_id=chat_id, text=warn)
-                    except Exception:
-                        pass
+                    await android_monitor_send(ctx, chat_id, warn)
                     break
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
-        try:
-            await ctx.bot.send_message(chat_id=chat_id, text="⏹️ Monitoring dibatalkan.")
-        except Exception:
-            pass
+        await android_monitor_send(ctx, chat_id, "⏹️ Monitoring dibatalkan.")
         raise
     finally:
         ANDROID_MONITOR_TASKS.pop(chat_id, None)
@@ -2069,6 +2095,14 @@ def android_monitor_cancel(chat_id: int):
         task.cancel()
 
 
+def android_monitor_logs_text(chat_id: int, limit: int = 10) -> str:
+    logs = list(ANDROID_MONITOR_LOGS.get(chat_id, []))[-limit:]
+    if not logs:
+        return "Belum ada log monitoring."
+    body = "\n".join(logs)
+    return code_block(body)
+
+
 def android_monitor_keyboard(running: bool) -> InlineKeyboardMarkup:
     rows = []
     if running:
@@ -2076,6 +2110,7 @@ def android_monitor_keyboard(running: bool) -> InlineKeyboardMarkup:
     else:
         rows.append([InlineKeyboardButton("▶️ Start Monitoring", callback_data="ANDROID_MONITOR_START")])
     rows.append([InlineKeyboardButton("✏️ Edit Konfigurasi", callback_data="ANDROID_MONITOR_CFG")])
+    rows.append([InlineKeyboardButton("🧾 Log (10 terakhir)", callback_data="ANDROID_MONITOR_LOGS")])
     rows.append([InlineKeyboardButton("🔙 Menu Android", callback_data="MENU_ANDROID")])
     return InlineKeyboardMarkup(rows)
 
@@ -5111,6 +5146,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
                                       reply_markup=android_monitor_keyboard(False))
         await query.message.reply_text("⏹️ Monitoring dihentikan.")
+        return
+
+    if data == "ANDROID_MONITOR_LOGS":
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        logs = android_monitor_logs_text(chat_id)
+        if logs.startswith("```"):
+            await query.message.reply_text(logs, parse_mode=ParseMode.MARKDOWN_V2)
+        else:
+            await query.message.reply_text(logs)
         return
 
     if data == "ANDROID_MONITOR_CFG":
