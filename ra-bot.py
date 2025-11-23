@@ -1979,21 +1979,26 @@ def android_monitor_running(chat_id: int) -> bool:
 
 def android_monitor_status_text(cfg: Dict[str, Any], running: bool) -> str:
     method_map = {
-        "https": "HTTPS \(secure HTTP ping\)",
-        "http": "HTTP \(standard\)",
-        "ping": "ICMP ping \(host\)",
+        "https": "HTTPS (secure HTTP ping)",
+        "http": "HTTP (standard)",
+        "ping": "ICMP ping (host)",
         "device-ping": "ICMP ping via Android",
     }
+
+    def esc(text: str) -> str:
+        return mdv2_escape(text)
+
     lines = ["📡 *Android Monitoring*"]
-    lines.append(f"Status: {'🟢 Aktif' if running else '⚪️ Tidak aktif'}")
-    method_label = method_map.get(cfg.get("method"), cfg.get("method"))
-    lines.append(f"Metode: {method_label}")
+    status_label = "🟢 Aktif" if running else "⚪️ Tidak aktif"
+    lines.append(esc(f"Status: {status_label}"))
+    method_label = method_map.get(cfg.get("method"), cfg.get("method")) or "-"
+    lines.append(esc(f"Metode: {method_label}"))
     lines.append(f"Host/URL: `{mdv2_escape(cfg.get('host', '-'))}`")
-    lines.append(f"Interval: {cfg.get('interval', '?')} detik")
-    lines.append(f"Max kegagalan: {cfg.get('max_failures', '?')} kali")
-    lines.append(f"Delay Airplane Mode: {cfg.get('airplane_delay', '?')} detik")
+    lines.append(esc(f"Interval: {cfg.get('interval', '?')} detik"))
+    lines.append(esc(f"Max kegagalan: {cfg.get('max_failures', '?')} kali"))
+    lines.append(esc(f"Delay Airplane Mode: {cfg.get('airplane_delay', '?')} detik"))
     lines.append("")
-    lines.append("Gunakan tombol di bawah untuk memulai atau mengubah konfigurasi monitoring.")
+    lines.append(esc("Gunakan tombol di bawah untuk memulai atau mengubah konfigurasi monitoring."))
     return "\n".join(lines)
 
 
