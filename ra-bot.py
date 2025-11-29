@@ -24,7 +24,7 @@ import os, re, shlex, subprocess, glob, sqlite3, time, math, urllib.request, url
 import sys, asyncio, tempfile, json, stat, contextlib
 from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 import shutil, errno  # — PATCH: untuk copy fallback EXDEV
 from dataclasses import dataclass, field
@@ -1908,6 +1908,222 @@ async def android_signal_monitor_task(ctx: ContextTypes.DEFAULT_TYPE, chat_id: i
 
         pass
 
+# ---- Android Monitoring (ping/http) ----
+ANDROID_MONITOR_DEFAULT = {
+    "method": "https",
+    "host": "chat.whatsapp.com",
+    "interval": 5,
+    "max_failures": 3,
+    "airplane_delay": 5,
+}
+
+ANDROID_MONITOR_TASKS: Dict[int, asyncio.Task] = {}
+ANDROID_MONITOR_LOGS: Dict[int, deque] = defaultdict(lambda: deque(maxlen=50))
+ANDROID_MONITOR_PENDING: Dict[int, List[str]] = defaultdict(list)
+
+
+def android_monitor_load_config() -> Dict[str, Any]:
+    cfg = dict(ANDROID_MONITOR_DEFAULT)
+    cfg["method"] = (settings_get("android_mon_method") or cfg["method"]).lower()
+    cfg["host"] = settings_get("android_mon_host", cfg["host"])
+    cfg["interval"] = int(settings_get("android_mon_interval", cfg["interval"]))
+    cfg["max_failures"] = int(settings_get("android_mon_maxfail", cfg["max_failures"]))
+    cfg["airplane_delay"] = int(settings_get("android_mon_airdelay", cfg["airplane_delay"]))
+    return cfg
+
+
+def android_monitor_save_config(cfg: Dict[str, Any]) -> None:
+    settings_set("android_mon_method", str(cfg.get("method", "")))
+    settings_set("android_mon_host", str(cfg.get("host", "")))
+    settings_set("android_mon_interval", str(cfg.get("interval", "")))
+    settings_set("android_mon_maxfail", str(cfg.get("max_failures", "")))
+    settings_set("android_mon_airdelay", str(cfg.get("airplane_delay", "")))
+
+
+def android_monitor_record(chat_id: int, entry: str) -> None:
+    ANDROID_MONITOR_LOGS[chat_id].append(entry)
+
+
+async def android_monitor_flush(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    pending = list(ANDROID_MONITOR_PENDING.get(chat_id) or [])
+    if not pending:
+        return
+    delivered = 0
+    for msg in pending:
+        try:
+            await ctx.bot.send_message(chat_id=chat_id, text=msg)
+            delivered += 1
+        except NetworkError:
+            break
+        except Exception:
+            break
+    if delivered:
+        ANDROID_MONITOR_PENDING[chat_id] = pending[delivered:]
+
+
+async def android_monitor_send(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    android_monitor_record(chat_id, text)
+    try:
+        await android_monitor_flush(ctx, chat_id)
+        await ctx.bot.send_message(chat_id=chat_id, text=text)
+    except NetworkError:
+        ANDROID_MONITOR_PENDING[chat_id].append(text)
+    except Exception:
+        ANDROID_MONITOR_PENDING[chat_id].append(text)
+
+
+def android_monitor_running(chat_id: int) -> bool:
+    task = ANDROID_MONITOR_TASKS.get(chat_id)
+    return bool(task) and not task.done()
+
+
+def android_monitor_status_text(cfg: Dict[str, Any], running: bool) -> str:
+    method_map = {
+        "https": "HTTPS (secure HTTP ping)",
+        "http": "HTTP (standard)",
+        "ping": "ICMP ping (host)",
+        "device-ping": "ICMP ping via Android",
+    }
+
+    def esc(text: str) -> str:
+        return mdv2_escape(text)
+
+    lines = ["📡 *Android Monitoring*"]
+    status_label = "🟢 Aktif" if running else "⚪️ Tidak aktif"
+    lines.append(esc(f"Status: {status_label}"))
+    method_label = method_map.get(cfg.get("method"), cfg.get("method")) or "-"
+    lines.append(esc(f"Metode: {method_label}"))
+    lines.append(f"Host/URL: `{mdv2_escape(cfg.get('host', '-'))}`")
+    lines.append(esc(f"Interval: {cfg.get('interval', '?')} detik"))
+    lines.append(esc(f"Max kegagalan: {cfg.get('max_failures', '?')} kali"))
+    lines.append(esc(f"Delay Airplane Mode: {cfg.get('airplane_delay', '?')} detik"))
+    lines.append("")
+    lines.append(esc("Gunakan tombol di bawah untuk memulai atau mengubah konfigurasi monitoring."))
+    return "\n".join(lines)
+
+
+def _android_monitor_http(url: str, timeout: int = 6) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= resp.getcode() < 400
+    except Exception:
+        return False
+
+
+def android_monitor_single(serial: str, cfg: Dict[str, Any]) -> Tuple[bool, str]:
+    method = (cfg.get("method") or "").lower()
+    host = cfg.get("host", "").strip()
+    if method in {"http", "https"}:
+        scheme = method
+        url = host
+        if not re.match(r"^[a-zA-Z]+://", host):
+            url = f"{scheme}://{host}"
+        ok = _android_monitor_http(url)
+        detail = f"{method.upper()} {url} => {'OK' if ok else 'FAILED'}"
+        return ok, detail
+    if method == "device-ping":
+        raw = android_shell(serial, "ping", "-c", "1", "-W", "2", host)
+        ok = raw and not raw.startswith("[ERR]") and "1 received" in raw
+        return bool(ok), f"Ping (Android) {host} => {'OK' if ok else 'FAILED'}"
+    out = run_cmd(f"ping -c 1 -W 2 {shlex.quote(host)}", timeout=6)
+    ok = out and not out.startswith("[ERR]") and "1 received" in out
+    return bool(ok), f"Ping {host} => {'OK' if ok else 'FAILED'}"
+
+
+async def android_monitor_loop(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, serial: str) -> None:
+    cfg = android_monitor_load_config()
+    interval = max(1, int(cfg.get("interval", 5)))
+    max_fail = max(1, int(cfg.get("max_failures", 3)))
+    failures = 0
+    start_ts = datetime.now(tz=TZ).strftime("%H:%M:%S")
+    await android_monitor_send(ctx, chat_id, f"▶️ Monitoring dimulai ({start_ts}).")
+    try:
+        while True:
+            ok, detail = android_monitor_single(serial, cfg)
+            now = datetime.now(tz=TZ).strftime("%H:%M:%S")
+            retry_text = ""
+            entry = f"{now} — {detail}"
+            if not ok:
+                retry_text = f" Retry {failures + 1}/{max_fail}"
+                await android_monitor_send(ctx, chat_id, f"{entry}{retry_text}")
+                failures += 1
+                if failures >= max_fail:
+                    warn = (
+                        f"❌ Monitoring dihentikan. Batas gagal {max_fail} tercapai. "
+                        f"(Delay airplane: {cfg.get('airplane_delay')}s)"
+                    )
+                    await android_monitor_send(ctx, chat_id, warn)
+                    break
+            else:
+                if failures > 0:
+                    recovery = f"{entry} (pulih setelah {failures} kegagalan)"
+                    await android_monitor_send(ctx, chat_id, recovery)
+                else:
+                    android_monitor_record(chat_id, entry)
+                failures = 0
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        await android_monitor_send(ctx, chat_id, "⏹️ Monitoring dibatalkan.")
+        raise
+    finally:
+        ANDROID_MONITOR_TASKS.pop(chat_id, None)
+
+
+def android_monitor_parse_config(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    cfg = android_monitor_load_config()
+    allowed_keys = {"method", "host", "interval", "max_failures", "airplane_delay"}
+    tokens = shlex.split(text)
+    if not tokens:
+        return None, "Tidak ada parameter yang dikirim."
+    for tok in tokens:
+        if "=" not in tok:
+            return None, f"Format tidak valid: {tok}. Gunakan key=value."
+        key, val = tok.split("=", 1)
+        key = key.strip().lower()
+        if key not in allowed_keys:
+            return None, f"Key {key} tidak dikenal."
+        if key in {"interval", "max_failures", "airplane_delay"}:
+            try:
+                cfg[key] = int(float(val))
+            except Exception:
+                return None, f"Nilai {key} harus angka."
+        else:
+            cfg[key] = val.strip()
+    if cfg["method"] not in {"http", "https", "ping", "device-ping"}:
+        return None, "Metode harus salah satu dari http/https/ping/device-ping."
+    if not cfg["host"]:
+        return None, "Host/URL tidak boleh kosong."
+    cfg["interval"] = max(1, cfg["interval"])
+    cfg["max_failures"] = max(1, cfg["max_failures"])
+    cfg["airplane_delay"] = max(0, cfg["airplane_delay"])
+    return cfg, None
+
+
+def android_monitor_cancel(chat_id: int):
+    task = ANDROID_MONITOR_TASKS.pop(chat_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def android_monitor_logs_text(chat_id: int, limit: int = 10) -> str:
+    logs = list(ANDROID_MONITOR_LOGS.get(chat_id, []))[-limit:]
+    if not logs:
+        return "Belum ada log monitoring."
+    body = "\n".join(logs)
+    return code_block(body)
+
+
+def android_monitor_keyboard(running: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if running:
+        rows.append([InlineKeyboardButton("⏹️ Stop Monitoring", callback_data="ANDROID_MONITOR_STOP")])
+    else:
+        rows.append([InlineKeyboardButton("▶️ Start Monitoring", callback_data="ANDROID_MONITOR_START")])
+    rows.append([InlineKeyboardButton("✏️ Edit Konfigurasi", callback_data="ANDROID_MONITOR_CFG")])
+    rows.append([InlineKeyboardButton("🧾 Log (10 terakhir)", callback_data="ANDROID_MONITOR_LOGS")])
+    rows.append([InlineKeyboardButton("🔙 Menu Android", callback_data="MENU_ANDROID")])
+    return InlineKeyboardMarkup(rows)
+
 
 # ------------------ DB (Speedtest + Settings + Alerts) -----
 
@@ -3461,6 +3677,7 @@ PROMPT_KEYS_BOOL = {
     "await_scheduler_action",
     "await_power_custom",
     "await_usbwd_config",
+    "await_android_mon_cfg",
 }
 
 PROMPT_KEYS_VALUE = {
@@ -3530,6 +3747,12 @@ def android_menu_keyboard(has_device: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📡 Monitor Sinyal", callback_data="ANDROID_SIGNAL_MONITOR"),
 
             InlineKeyboardButton("📝 Export Report", callback_data="ANDROID_EXPORT"),
+
+        ])
+
+        rows.append([
+
+            InlineKeyboardButton("🛜 Monitoring", callback_data="ANDROID_MONITOR"),
 
         ])
 
@@ -4887,6 +5110,86 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.application.create_task(android_signal_monitor_task(ctx, update.effective_chat.id, device))
         return
 
+    if data == "ANDROID_MONITOR":
+        device = android_selected_device(ctx)
+        if not device:
+            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
+            return
+        if not android_device_ready(device):
+            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
+            return
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        cfg = android_monitor_load_config()
+        running = android_monitor_running(chat_id)
+        text = android_monitor_status_text(cfg, running)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                      reply_markup=android_monitor_keyboard(running))
+        return
+
+    if data == "ANDROID_MONITOR_START":
+        device = android_selected_device(ctx)
+        if not device:
+            await query.message.reply_text("❌ Pilih device terlebih dahulu melalui Menu Android.")
+            return
+        if not android_device_ready(device):
+            await query.message.reply_text("❌ Device tidak siap. Buka Menu Android dan lakukan refresh.")
+            return
+        if not ctx.application or not update.effective_chat:
+            await query.message.reply_text("❌ Monitoring tidak bisa dijalankan di konteks ini.")
+            return
+        chat_id = update.effective_chat.id
+        android_monitor_cancel(chat_id)
+        task = ctx.application.create_task(android_monitor_loop(ctx, chat_id, device))
+        ANDROID_MONITOR_TASKS[chat_id] = task
+        cfg = android_monitor_load_config()
+        text = android_monitor_status_text(cfg, True)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                      reply_markup=android_monitor_keyboard(True))
+        await query.message.reply_text("▶️ Monitoring Android dimulai sesuai konfigurasi.")
+        return
+
+    if data == "ANDROID_MONITOR_STOP":
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        android_monitor_cancel(chat_id)
+        cfg = android_monitor_load_config()
+        text = android_monitor_status_text(cfg, False)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                      reply_markup=android_monitor_keyboard(False))
+        await query.message.reply_text("⏹️ Monitoring dihentikan.")
+        return
+
+    if data == "ANDROID_MONITOR_LOGS":
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        logs = android_monitor_logs_text(chat_id)
+        if logs.startswith("```"):
+            await query.message.reply_text(logs, parse_mode=ParseMode.MARKDOWN_V2)
+        else:
+            await query.message.reply_text(logs)
+        return
+
+    if data == "ANDROID_MONITOR_CFG":
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        running = android_monitor_running(chat_id)
+        ctx.user_data["await_android_mon_cfg"] = True
+        sample = (
+            "method=https host=chat.whatsapp.com interval=5 max_failures=3 airplane_delay=5"
+        )
+        prompt_lines = [
+            mdv2_escape("✏️ Kirim konfigurasi monitoring (key=value dipisah spasi)."),
+            mdv2_escape(
+                "Key: method(http/https/ping/device-ping), host, interval, max_failures, airplane_delay."
+            ),
+            mdv2_escape("Contoh:"),
+            code_block(sample),
+        ]
+        msg = "\n".join(prompt_lines)
+        await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+        cfg = android_monitor_load_config()
+        text = android_monitor_status_text(cfg, running)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                      reply_markup=android_monitor_keyboard(running))
+        return
+
     if data == "ANDROID_EXPORT":
         device = android_selected_device(ctx)
         if not device:
@@ -6003,6 +6306,19 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(code_block(out), parse_mode=ParseMode.MARKDOWN_V2)
         else:
             await update.message.reply_text("❌ IP tidak valid.")
+        return
+
+    if ctx.user_data.get("await_android_mon_cfg"):
+        ctx.user_data["await_android_mon_cfg"] = False
+        cfg, err = android_monitor_parse_config(text)
+        if err:
+            await update.message.reply_text(f"❌ {err}")
+            return
+        android_monitor_save_config(cfg)
+        running = android_monitor_running(update.effective_chat.id if update.effective_chat else 0)
+        msg = android_monitor_status_text(cfg, running)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2,
+                                        reply_markup=android_monitor_keyboard(running))
         return
 
     if ctx.user_data.get("await_power_custom"):
